@@ -14,8 +14,6 @@ import jax.experimental.sparse as jsp
 from collections import namedtuple
 from tqdm import trange
 from functools import partial
-import jax.experimental.host_callback as hcb
-
 
 np.bool = np.bool_
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
@@ -722,11 +720,9 @@ def mech(
         resid     = -F_node * Q_dof
         # dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
         
-        # jax.debug.print("free DOFs = {}", jnp.sum(Q_dof))
+        jax.debug.print("free DOFs = {}", jnp.sum(Q_dof))
         dU_flat, info = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
-        # jax.debug.print("CG failed? info = {}", info)
-        hcb.id_print(cg_state.converged, what="🔎 CG converged?")
-        hcb.id_print(jnp.any(jnp.isnan(dU_flat)), what="🔎 NaNs in dU_flat")
+        jax.debug.print("CG failed? info = {}", info)
         
         # 6) Un-flatten and update
         dU_new = dU_flat.reshape((n_n, 3))
@@ -860,9 +856,9 @@ def main_function(params, target, smooth_weight=1e-2):
         jnp.zeros((steps - power_on_steps,))
     ], axis=0)
 
-    hcb.id_print(jnp.min(control), what="🔎 control min")
-    hcb.id_print(jnp.max(control), what="🔎 control max")
-
+    jax.debug.print("control min {}", jnp.min(control))
+    jax.debug.print("control max {}", jnp.max(control))
+    
     smooth_penalty = smooth_weight * jnp.sum((params[1:] - params[:-1])**2)
     temperatures = simulate_temperature(control)
     S_seq = simulate_mechanics(temperatures)
@@ -894,6 +890,7 @@ def train_model(params_init, target, num_iterations, output_dir, learning_rate=1
 
         # JAX-traced loss + gradient
         (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target, smooth_weight)
+        debug_main(params, target)
         
         jax.debug.print("Loss: {}, grad_norm: {}", loss, optax.global_norm(grads))
         jax.tree.map(lambda x: jnp.any(jnp.isnan(x)), grads)
@@ -960,6 +957,22 @@ def run_sin_target(output_path="./implicit_debug/Ss_target.npy"):
     t_end = time.time()
     print(f"✅ Vtks saved to ./vtk_out, finished in {t_end - t_start:.2f} seconds")
 
+def debug_main(params, target):
+    (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target)
+    # print whether loss is NaN
+    hcb.id_tap(loss, what="🔎 loss")
+    jax.debug.print("Loss: {loss}", loss = loss)
+
+    # walk the grads tree and print any NaN flags
+    def check_nan(g, path):
+        flag = jnp.any(jnp.isnan(g))
+        jax.debug.print("NaN?: {flag}, in grad at {path}", flag = flag, path=path)
+
+    jax.tree_util.tree_map_with_path(check_nan, grads)
+    return loss, control, grads
+
+# then call debug_main in your training loop instead of value_and_grad(main_function,…)
+
 # --- Simulation state containers ---
 ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
@@ -1004,12 +1017,12 @@ node_birth = jnp.array(node_birth)
 # Material models
 poisson = 0.3
 a1 = 10000
-young1 = jnp.array(np.loadtxt('./0_properties/TI64_Young_Debroy.txt')[:, 1]) / 1e6
-temp_young1 = jnp.array(np.loadtxt('./0_properties/TI64_Young_Debroy.txt')[:, 0])
-Y1 = jnp.array(np.loadtxt('./0_properties/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
-temp_Y1 = jnp.array(np.loadtxt('./0_properties/TI64_Yield_Debroy.txt')[:, 0])
-scl1 = jnp.array(np.loadtxt('./0_properties/TI64_Alpha_Debroy.txt')[:, 1])
-temp_scl1 = jnp.array(np.loadtxt('./0_properties/TI64_Alpha_Debroy.txt')[:, 0])
+young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 1]) / 1e6
+temp_young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 0])
+Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
+scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
+temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
 
 # young1 = jnp.array(np.loadtxt('./0_properties/SS316L_Young.txt')[:, 1]) / 1e6
 # temp_young1 = jnp.array(np.loadtxt('./0_properties/SS316L_Young.txt')[:, 0])
