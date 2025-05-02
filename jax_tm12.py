@@ -960,7 +960,6 @@ def run_sin_target(output_path="./implicit_debug/Ss_target.npy"):
 def debug_main(params, target):
     (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target)
     # print whether loss is NaN
-    hcb.id_tap(loss, what="🔎 loss")
     jax.debug.print("Loss: {loss}", loss = loss)
 
     # walk the grads tree and print any NaN flags
