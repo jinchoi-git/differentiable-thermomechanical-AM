@@ -718,55 +718,14 @@ def mech(
 
         # 5) Solve for increment dU in flattened form
         resid     = -F_node * Q_dof
-        # dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
-        
-        # jax.debug.print("free DOFs = {}", jnp.sum(Q_dof))
-        dU_flat, info = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
-        # jax.debug.print("CG failed? info = {}", info)
+        dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
         
         # 6) Un-flatten and update
         dU_new = dU_flat.reshape((n_n, 3))
-        # U_it   = U_it + beta * dU_new
         U_it   = U_it + dU_new
 
-        # dU_norm = jnp.linalg.norm(dU_flat)
-        # jax.debug.print(" ‖dU‖ = {}", dU_norm)
+        return jax.lax.stop_gradient((U_it, dU))
 
-        # return jax.lax.stop_gradient((U_it, dU))
-        return U_it, dU
-    
-    
-    # for beta in [1.0, 0.5, 0.3, 0.1]:
-    #     U_it = U * mask_n[:, None]  
-    #     dU = jnp.zeros_like(U_it)
-    #     init_state = (U_it, dU)
-    #     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, init_state)
-
-    #     E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
-    #     E = (E_base - E_th) * mask_e[:, None, None]
-    #     S, DS, _, _, _ = constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y)
-
-    # # Update displacements
-    # U = jax.lax.dynamic_update_slice(U, U_it, (0, 0))  
-    
-    
-    # S0 = jnp.zeros((n_e, n_q, 6), dtype=U.dtype)
-    # # run Newton loop
-    # # state0 = (U * mask_n[:, None], jnp.zeros_like(U))
-    # U_it = U * mask_n[:, None]  
-    # dU = jnp.zeros_like(U_it)
-    
-    # for beta in [1.0, 0.5, 0.3, 0.1]:       
-    #     state0 = U_it, dU
-    #     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
-    
-    # # Final stress for output
-    # E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
-    # E_corr = (E_base - E_th) * mask_e[:, None, None]
-    # S_final, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
-        
-    # # Update global U
-    # U = jax.lax.dynamic_update_slice(U, U_it, (0, 0))
         
     state0 = (U * mask_n[:, None], jnp.zeros_like(U))
     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
@@ -1118,7 +1077,3 @@ print("any NaNs in ∂loss/∂T0? ", bool(jnp.any(jnp.isnan(grad_T0))))
 print("grad_T0 norm:", jnp.linalg.norm(grad_T0))
 
 
-
-# # run it
-# if __name__ == "__main__":
-#     debug_one_element()
