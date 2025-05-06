@@ -648,6 +648,7 @@ def mech(
     alpha_Th = jnp.zeros((n_e, n_q, 6)).at[:, :, 0:3].set(scl[:, :, None].repeat(3, axis=2))
     E_th = (temperature_ip[:, :, None].repeat(6, axis=2) - T_Ref) * alpha_Th
     E_th = E_th * mask_e[:, None, None]
+    jax.debug.print("🔎 E_th min/max = {mn}/{mx}", mn=jnp.nanmin(E_th), mx=jnp.nanmax(E_th))
     
     # Elastic matrices (computed for all elements)
     ele_K, ele_B, ele_D, ele_detJac = jax.vmap(
@@ -671,21 +672,29 @@ def mech(
 
         # 1) Compute strain E and stress S at Gauss points
         E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
+        jax.debug.print("🔎 E_base nan? {f}", f=jnp.any(jnp.isnan(E_base)))
+        
         E_corr = (E_base - E_th) * mask_e[:, None, None]
-        S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+        # S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+        
+        S, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+        jax.debug.print("🔎 S nan? {f}", f=jnp.any(jnp.isnan(S)))
+        jax.debug.print("🔎 DS nan? {f}", f=jnp.any(jnp.isnan(DS)))
+        jax.debug.print("🔎 IND_p any True? {f}", f=jnp.any(IND_p))
 
         # 2) Tangent stiffness per element
         D_diff    = (ele_detJac[:, :, None, None] * DS) - ele_D
         B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)   # (n_e,24,24)
         K_tangent = ele_K + B_T_D_B                          # (n_e,24,24)
+        jax.debug.print("🔎 K_tangent norm = {n}", n=jnp.linalg.norm(K_tangent))
         
-        # —— Stabilizer: for any element with mask_e==0, replace its 24×24 block by eps·I
-        eps   = 1e-8
-        eye24 = jnp.eye(24)[None, :, :]                       # shape (1,24,24)
-        is_act = mask_e > 0.0                                 # boolean mask (n_e,)
-        K_tangent = jnp.where(is_act[:, None, None],
-                              K_tangent,                     # active: use true tangent
-                              eps * eye24)                   # inactive: tiny identity
+        # # —— Stabilizer: for any element with mask_e==0, replace its 24×24 block by eps·I
+        # eps   = 1e-8
+        # eye24 = jnp.eye(24)[None, :, :]                       # shape (1,24,24)
+        # is_act = mask_e > 0.0                                 # boolean mask (n_e,)
+        # K_tangent = jnp.where(is_act[:, None, None],
+        #                       K_tangent,                     # active: use true tangent
+        #                       eps * eye24)                   # inactive: tiny identity
 
         # 3) Compute residual internal force F_node
         detS      = ele_detJac[..., None] * S               # (n_e,n_q,6)
@@ -694,6 +703,7 @@ def mech(
         elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e,8))
         F_node    = jnp.zeros((n_dof,))
         F_node    = F_node.at[elem_dofs.flatten()].add(F_e.flatten())
+        jax.debug.print("🔎 F_node nan? {f}", f=jnp.any(jnp.isnan(F_node)))
 
         # 4) Matrix‐free matvec for CG
         def mech_matvec(x):
@@ -718,7 +728,11 @@ def mech(
 
         # 5) Solve for increment dU in flattened form
         resid     = -F_node * Q_dof
-        dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
+        # dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
+        dU_flat, cg_state = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
+
+        jax.debug.print("🔎 dU_flat nan? {f}", f=jnp.any(jnp.isnan(dU_flat)))
+        jax.debug.print("🔎 final resid norm = {n}", n=jnp.linalg.norm(resid - mech_matvec(dU_flat)))
         
         # 6) Un-flatten and update
         dU_new = dU_flat.reshape((n_n, 3))
@@ -993,7 +1007,7 @@ T_Ref = ambient
 tol = 1e-4
 cg_tol = 1e-4
 # Maxit = 20
-Maxit = 10
+Maxit = 1
 
 # Load stress target
 target = jnp.load(os.path.join(output_dir, "Ss_target.npy"))
