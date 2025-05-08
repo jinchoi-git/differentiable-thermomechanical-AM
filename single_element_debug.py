@@ -259,7 +259,8 @@ data_dir = 'data_10x5'
 toolpath_name = '10x5_toolpath.crs'
 
 if Load_data:
-    elements = jnp.load(f'{data_dir}/elements.npy')[0:1]
+    elements = jnp.load(f'{data_dir}/elements.npy')
+    # elements = jnp.load(f'{data_dir}/elements.npy')[0:1]
     nodes = jnp.load(f'{data_dir}/nodes.npy')
     surfaces = jnp.load(f'{data_dir}/surface.npy')
     node_birth = jnp.load(f'{data_dir}/node_birth.npy')
@@ -391,12 +392,23 @@ def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal=None
     S_tr = jnp.squeeze(ELASTC @ E_tr[..., None])         # Full trial stress
     SD_tr = (2 * DEV * shear[..., None, None] @ E_tr[..., None]).squeeze() - Hard_prev  # Deviatoric stress minus backstress
 
-    # 3. Yield criterion (von Mises style)
-    norm_SD = jnp.sqrt(jnp.sum(SD_tr[..., :3]**2, axis=-1) + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1))  # ||SD||
-#     norm_SD = jnp.sqrt(jnp.clip(
-#     jnp.sum(SD_tr[..., :3]**2, axis=-1) + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1),
-#     1e-8, 1e8
-# ))
+    # -# 3. Yield criterion (von Mises style)
+    # -norm_SD = jnp.sqrt(jnp.sum(SD_tr[..., :3]**2, axis=-1) + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1))  # ||SD||
+    # norm_SD = jnp.sqrt(jnp.clip(sq, 1e-8, None))
+    
+    ###
+    sq = (
+        jnp.sum(SD_tr[..., :3]**2, axis=-1)
+      + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1)
+    )
+    # debug: see if sq ever goes exactly zero or negative
+    jax.debug.print("🔎 sq min/max = {mn}/{mx}", mn=jnp.min(sq), mx=jnp.max(sq))
+    
+    # clamp to avoid infinite derivative of sqrt at zero
+    eps_norm = 1e-8
+    norm_SD = jnp.sqrt(jnp.clip(sq, eps_norm, None))
+    jax.debug.print("🔎 norm_SD = {ns}", ns=norm_SD)
+    ###
 
     CRIT = norm_SD - Y
     IND_p = CRIT > 0.0    # Plastic indicator
@@ -405,8 +417,15 @@ def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal=None
     # 4. Safe computation (avoid divide-by-zero)
     safe_norm_SD = jnp.where(IND_p, norm_SD, 1.0)
     safe_denom = jnp.where(IND_p, 2 * shear + a, 1.0)
-    N_hat = SD_tr / safe_norm_SD[..., None]  # Plastic flow direction
-    Lambda = jnp.where(IND_p, CRIT / safe_denom, 0.0)  # Consistent increment
+    #- N_hat = SD_tr / safe_norm_SD[..., None]  # Plastic flow direction
+    # - Lambda = jnp.where(IND_p, CRIT / safe_denom, 0.0)  # Consistent increment
+    
+    N_hat  = SD_tr / safe_norm_SD[..., None]
+    jax.debug.print("🔎 any NaNs in N_hat? {f}", f=jnp.any(jnp.isnan(N_hat)))
+    
+    Lambda = jnp.where(IND_p, CRIT / safe_denom, 0.0)
+    jax.debug.print("🔎 any NaNs in Lambda? {f}", f=jnp.any(jnp.isnan(Lambda)))
+
     
     # 5. Stress update
     S = S_tr - 2 * shear[..., None] * Lambda[..., None] * N_hat
@@ -688,7 +707,7 @@ def mech(
         K_tangent = ele_K + B_T_D_B                          # (n_e,24,24)
         jax.debug.print("🔎 K_tangent norm = {n}", n=jnp.linalg.norm(K_tangent))
         
-        # # —— Stabilizer: for any element with mask_e==0, replace its 24×24 block by eps·I
+        # # # —— Stabilizer: for any element with mask_e==0, replace its 24×24 block by eps·I
         # eps   = 1e-8
         # eye24 = jnp.eye(24)[None, :, :]                       # shape (1,24,24)
         # is_act = mask_e > 0.0                                 # boolean mask (n_e,)
@@ -775,8 +794,8 @@ def simulate_temperature(control):
         m_vec, rhs = update_mvec_stiffness(m_vec, rhs, cps, elements, temperature, ae, an)
         rhs = update_fluxes(t, rhs, temperature, base_power, control_t, asurf)
 
-        # update = dt * rhs / (m_vec + 1e-8)* an    
-        update = dt * rhs / m_vec * an 
+        update = dt * rhs / (m_vec + 1e-8)* an    
+        # update = dt * rhs / m_vec * an 
         
         temperature = temperature + update
         temperature = temperature.at[bot_nodes].set(ambient)
@@ -863,11 +882,12 @@ def train_model(params_init, target, num_iterations, output_dir, learning_rate=1
 
         # JAX-traced loss + gradient
         (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target, smooth_weight)
-        debug_main(params, target)
+        # debug_main(params, target)
         
+        any_nans = jax.tree_util.tree_leaves(grads)
+        any_nans = any(jnp.any(jnp.isnan(g)) for g in any_nans)
+        print("🚨 any NaNs in grads?", any_nans)
         jax.debug.print("Loss: {}, grad_norm: {}", loss, optax.global_norm(grads))
-        jax.tree.map(lambda x: jnp.any(jnp.isnan(x)), grads)
-
 
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -1015,13 +1035,29 @@ target = jnp.load(os.path.join(output_dir, "Ss_target.npy"))
 # Initialize control parameters
 params_init = jnp.ones((power_on_steps,)) * 1.0
 
-# if __name__ == "__main__":
-#     if "forward" in sys.argv:
-#         run_sin_target()
-#         exit()
+###
 
-#     # Otherwise, run training
-#     trained_params, loss_history, control_history = train_model(
+# grad_params = jax.grad(lambda p: jax.value_and_grad(main_function, has_aux=True)(p, target)[0])(params_init)
+# print("Any NaNs in full ∂loss/∂params? ", bool(jnp.any(jnp.isnan(grad_params))))
+# print("grad norm:", jnp.linalg.norm(grad_params))
+
+###
+
+###
+
+# # Compute both (loss, control) and grads in one shot:
+# (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params_init, target)
+
+# # Now grads is exactly ∂loss/∂params.  You can inspect it:
+# any_nans = jax.tree_util.tree_leaves(grads)
+# any_nans = any(jnp.any(jnp.isnan(g)) for g in any_nans)
+# print("🚨 any NaNs in grads?", any_nans)
+
+###
+
+###
+
+# train_model(
 #         params_init=params_init,
 #         target=target,
 #         num_iterations=3,
@@ -1029,6 +1065,23 @@ params_init = jnp.ones((power_on_steps,)) * 1.0
 #         learning_rate=1e-3,
 #         smooth_weight=1e-2
 #     )
+
+###
+
+if __name__ == "__main__":
+    if "forward" in sys.argv:
+        run_sin_target()
+        exit()
+
+    # Otherwise, run training
+    trained_params, loss_history, control_history = train_model(
+        params_init=params_init,
+        target=target,
+        num_iterations=1000,
+        output_dir=output_dir,
+        learning_rate=1e-3,
+        smooth_weight=1e-2
+    )
     
 # --------------------------------------------
 # DEBUG: single‐element sanity check
@@ -1081,13 +1134,84 @@ def single_elem_loss(T0):
     # pick a simple scalar: sum of all stress entries
     return jnp.sum(S)
 
-debug_one_element()
+###
 
-# now take the gradient of that loss w.r.t. T0
-grad_T0 = jax.grad(single_elem_loss)(jnp.full((n_n,), ambient))
+# debug_one_element()
+# grad_T0 = jax.grad(single_elem_loss)(jnp.full((n_n,), ambient))
 
-# inspect if any entry is NaN
-print("any NaNs in ∂loss/∂T0? ", bool(jnp.any(jnp.isnan(grad_T0))))
-print("grad_T0 norm:", jnp.linalg.norm(grad_T0))
+# # inspect if any entry is NaN
+# print("any NaNs in ∂loss/∂T0? ", bool(jnp.any(jnp.isnan(grad_T0))))
+# print("grad_T0 norm:", jnp.linalg.norm(grad_T0))
 
+###
 
+# # Re-use your single-element setup
+# T0 = jnp.full((n_n,), ambient)
+# ae = jnp.array([1.0])
+# an = jnp.ones((n_n,))
+
+# U0    = jnp.zeros((n_n,3))
+# E0    = jnp.zeros((1,n_q,6))
+# Ep0   = jnp.zeros((1,n_q,6))
+# Hard0 = jnp.zeros((1,n_q,6))
+# dU0   = jnp.zeros((n_n,3))
+
+# # Define a function that returns the element stress S (shape (1,8,6))
+# def S_fn(T):
+#     S, *_ = mech(
+#         temperature         = T,
+#         active_element_inds = ae,
+#         active_node_inds    = an,
+#         U                   = U0,
+#         E                   = E0,
+#         Ep_prev             = Ep0,
+#         Hard_prev           = Hard0,
+#         dU                  = dU0,
+#         current_time        = 0.0,
+#     )
+#     return S  # shape (1,8,6)
+
+# # 1) Compute the full Jacobian dS/dT
+# J = jax.jacrev(S_fn)(T0)   # shape (1,8,6, n_n)
+# print("any NaNs in dS/dT?", bool(jnp.any(jnp.isnan(J))))
+# print("J shape:", J.shape)
+
+# # 2) Or get the gradient of sum(S) w.r.t T via a VJP
+# #    (equivalent to your single_elem_loss, but lets you inspect the raw vector)
+# S0, pullback = jax.vjp(S_fn, T0)
+# gradT, = pullback(jnp.ones_like(S0))  # shape (n_n,)
+# print("any NaNs in ∂sum(S)/∂T?", bool(jnp.any(jnp.isnan(gradT))))
+# print("gradT norm:", jnp.linalg.norm(gradT))
+
+###
+
+# # --- re‐use your debug_one_element setup to get these values ---
+
+# temperature_ip = jnp.ones((1, n_q)) * 300    # shape (1, n_q) from your debug run
+# E_corr         = jnp.zeros((1, n_q, 6))    # since U=0 and E_th=0
+# Ep_prev        = jnp.zeros((1, n_q, 6))
+# Hard_prev      = jnp.zeros((1, n_q, 6))
+# shear          = jnp.interp(temperature_ip, temp_young1, young1) \
+#                     /(2*(1+poisson))
+# bulk           = jnp.interp(temperature_ip, temp_young1, young1) \
+#                     /(3*(1-2*poisson))
+# Y              = jnp.interp(temperature_ip, temp_Y1, Y1)
+# a              = a1 * jnp.ones_like(shear)
+
+# # build a standalone function that returns the scalar sum of all stress components
+# def S_constitutive_flat(E_flat):
+#     # reshape back to (1,n_q,6)
+#     E3 = E_flat.reshape((1, n_q, 6))
+#     S, DS, IND_p, Ep, Hard = constitutive_problem(
+#         E3, Ep_prev, Hard_prev, shear, bulk, a, Y
+#     )
+#     return jnp.sum(S)
+
+# # flatten E_corr and take its gradient
+# E_flat = E_corr.flatten()
+# grad_E = jax.grad(S_constitutive_flat)(E_flat)
+
+# # print("⧗ any NaNs in ∂S/∂E_corr? ", bool(jnp.any(jnp.isnan(grad_E))))
+# print("NaNs in ∂S/∂E_corr after clamp?", bool(jnp.any(jnp.isnan(grad_E))))
+
+###
