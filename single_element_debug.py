@@ -848,8 +848,8 @@ def main_function(params, target, smooth_weight=1e-2):
         jnp.zeros((steps - power_on_steps,))
     ], axis=0)
 
-    jax.debug.print("control min {}", jnp.min(control))
-    jax.debug.print("control max {}", jnp.max(control))
+    # jax.debug.print("control min {}", jnp.min(control))
+    # jax.debug.print("control max {}", jnp.max(control))
     
     smooth_penalty = smooth_weight * jnp.sum((params[1:] - params[:-1])**2)
     temperatures = simulate_temperature(control)
@@ -886,8 +886,8 @@ def train_model(params_init, target, num_iterations, output_dir, learning_rate=1
         
         any_nans = jax.tree_util.tree_leaves(grads)
         any_nans = any(jnp.any(jnp.isnan(g)) for g in any_nans)
-        print("🚨 any NaNs in grads?", any_nans)
-        jax.debug.print("Loss: {}, grad_norm: {}", loss, optax.global_norm(grads))
+        # print("🚨 any NaNs in grads?", any_nans)
+        # jax.debug.print("Loss: {}, grad_norm: {}", loss, optax.global_norm(grads))
 
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -899,7 +899,7 @@ def train_model(params_init, target, num_iterations, output_dir, learning_rate=1
         loss_history.append(loss)
         control_history.append(control)
 
-        if iteration % 1 == 0:
+        if iteration % 10 == 0:
             # Save parameters
             np.save(os.path.join(output_dir, f"params_{iteration:04d}.npy"), np.array(params))
             np.save(os.path.join(output_dir, f"control_{iteration:04d}.npy"), np.array(control))
@@ -1074,6 +1074,10 @@ if __name__ == "__main__":
         exit()
 
     # Otherwise, run training
+    
+    t_start = time.time()
+
+    
     trained_params, loss_history, control_history = train_model(
         params_init=params_init,
         target=target,
@@ -1083,6 +1087,9 @@ if __name__ == "__main__":
         smooth_weight=1e-2
     )
     
+    t_end = time.time()
+    print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
+
 # --------------------------------------------
 # DEBUG: single‐element sanity check
 # --------------------------------------------
