@@ -20,7 +20,7 @@ os.environ["CUDA_VISIBLE_DEVICES"]="3"
 # jax.config.update("jax_enable_x64", True)
 
 # --- Config ---
-output_dir = "./minimize_stress_lr1e2"
+output_dir = "./check_gradient_orig_nostop"
 os.makedirs(output_dir, exist_ok=True)
 
 '''
@@ -575,7 +575,8 @@ def mech(
         dU_new = dU_flat.reshape((n_n, 3))
         U_it   = U_it + dU_new
 
-        return jax.lax.stop_gradient((U_it, dU))
+        # return jax.lax.stop_gradient((U_it, dU))
+        return U_it, dU
         
     state0 = (U * mask_n[:, None], jnp.zeros_like(U))
     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
@@ -785,7 +786,7 @@ if __name__ == "__main__":
     t_start = time.time()
     trained_params, loss_history, control_history = train_model(
         params_init=params_init,
-        num_iterations=500,
+        num_iterations=3,
         output_dir=output_dir,
         learning_rate=1e-2,
         smooth_weight=1e-2

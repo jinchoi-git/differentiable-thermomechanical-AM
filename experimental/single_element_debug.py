@@ -16,12 +16,8 @@ from tqdm import trange
 from functools import partial
 
 np.bool = np.bool_
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 # jax.config.update("jax_enable_x64", True)
-
-# --- Config ---
-output_dir = "./minimize_stress_lr1e2"
-os.makedirs(output_dir, exist_ok=True)
 
 '''
 Load mesh information from .k file in LS-DYNA input format
@@ -397,13 +393,23 @@ def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal=None
     SD_tr = (2 * DEV * shear[..., None, None] @ E_tr[..., None]).squeeze() - Hard_prev  # Deviatoric stress minus backstress
 
     # -# 3. Yield criterion (von Mises style)
+    # -norm_SD = jnp.sqrt(jnp.sum(SD_tr[..., :3]**2, axis=-1) + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1))  # ||SD||
+    # norm_SD = jnp.sqrt(jnp.clip(sq, 1e-8, None))
+    
+    ###
     sq = (
         jnp.sum(SD_tr[..., :3]**2, axis=-1)
       + 2 * jnp.sum(SD_tr[..., 3:]**2, axis=-1)
     )
+    # debug: see if sq ever goes exactly zero or negative
+    jax.debug.print("🔎 sq min/max = {mn}/{mx}", mn=jnp.min(sq), mx=jnp.max(sq))
+    
+    # clamp to avoid infinite derivative of sqrt at zero
     eps_norm = 1e-8
     norm_SD = jnp.sqrt(jnp.clip(sq, eps_norm, None))
-    #jax.debug.print("🔎 norm_SD = {ns}", ns=norm_SD)
+    jax.debug.print("🔎 norm_SD = {ns}", ns=norm_SD)
+    ###
+
     CRIT = norm_SD - Y
     IND_p = CRIT > 0.0    # Plastic indicator
     mask = IND_p.astype(jnp.float32)
@@ -411,8 +417,15 @@ def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal=None
     # 4. Safe computation (avoid divide-by-zero)
     safe_norm_SD = jnp.where(IND_p, norm_SD, 1.0)
     safe_denom = jnp.where(IND_p, 2 * shear + a, 1.0)
+    #- N_hat = SD_tr / safe_norm_SD[..., None]  # Plastic flow direction
+    # - Lambda = jnp.where(IND_p, CRIT / safe_denom, 0.0)  # Consistent increment
+    
     N_hat  = SD_tr / safe_norm_SD[..., None]
+    jax.debug.print("🔎 any NaNs in N_hat? {f}", f=jnp.any(jnp.isnan(N_hat)))
+    
     Lambda = jnp.where(IND_p, CRIT / safe_denom, 0.0)
+    jax.debug.print("🔎 any NaNs in Lambda? {f}", f=jnp.any(jnp.isnan(Lambda)))
+
     
     # 5. Stress update
     S = S_tr - 2 * shear[..., None] * Lambda[..., None] * N_hat
@@ -467,6 +480,154 @@ def transformation(Q_int, active_elements, ele_detJac, n_n_save):
     
     return Q_node
 
+def save_vtk(T_seq, S_seq, U_seq, ele_detJac_seq, elements, nodes, element_birth, node_birth, dt, out_dir="./vtk_out", stride=10):
+    os.makedirs(out_dir, exist_ok=True)
+    T_total = S_seq.shape[0]
+        
+    for t in range(0, T_total):
+        dt = 0.1 
+        current_time = t * dt
+        filename = os.path.join(out_dir, f"out_{t:04d}.vtk")
+        
+        S = S_seq[t]
+        U = U_seq[t]
+        T = T_seq[int(t*10)]   
+        ele_detJac = ele_detJac_seq[t]
+        
+        # Recompute activation masks at this time
+        active_element_inds = np.array(element_birth <= current_time)
+        active_node_inds = np.array(node_birth <= current_time)
+        n_e_save = int(np.sum(active_element_inds))
+        n_n_save = int(np.sum(active_node_inds))
+        
+        active_elements_list = elements[active_element_inds].tolist()
+        active_cells = np.array([item for sublist in active_elements_list for item in [8] + sublist])
+        active_cell_type = np.array([vtk.VTK_HEXAHEDRON] * len(active_elements_list))
+        
+        # points = np.array(nodes[0:n_n_save] + U[0:n_n_save])
+        points = np.array(nodes[0:n_n_save])
+        
+        Sv = transformation(np.sqrt(1/2 * ((S[0:n_e_save,:,0] - S[0:n_e_save,:,1])**2 + 
+                                        (S[0:n_e_save,:,1] - S[0:n_e_save,:,2])**2 + 
+                                        (S[0:n_e_save,:,2] - S[0:n_e_save,:,0])**2 + 
+                                        6 * (S[0:n_e_save,:,3]**2 + S[0:n_e_save,:,4]**2 + S[0:n_e_save,:,5]**2))), 
+                        elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S11 = transformation(S[0:n_e_save,:,0], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S22 = transformation(S[0:n_e_save,:,1], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S33 = transformation(S[0:n_e_save,:,2], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S12 = transformation(S[0:n_e_save,:,3], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S23 = transformation(S[0:n_e_save,:,4], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S13 = transformation(S[0:n_e_save,:,5], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+    
+        # Using pyvista for vtk
+        active_grid = pv.UnstructuredGrid(active_cells, active_cell_type, points)
+        active_grid.point_data['temp'] = np.clip(np.array(T[0:n_n_save]), 300, 2300)
+        active_grid.point_data['S_von'] = np.array(Sv)
+        active_grid.point_data['S11'] = np.array(S11)
+        active_grid.point_data['S22'] = np.array(S22)
+        active_grid.point_data['S33'] = np.array(S33)
+        active_grid.point_data['S12'] = np.array(S12)
+        active_grid.point_data['S23'] = np.array(S23)
+        active_grid.point_data['S13'] = np.array(S13)
+        active_grid.point_data['U1'] = np.array(U[0:n_n_save, 0])
+        active_grid.point_data['U2'] = np.array(U[0:n_n_save, 1])
+        active_grid.point_data['U3'] = np.array(U[0:n_n_save, 2])
+        active_grid.save(filename)
+
+def save_vtk_2(T_seq, S_seq, elements, nodes, element_birth, node_birth, dt, out_dir="./vtk_out", stride=10):
+    os.makedirs(out_dir, exist_ok=True)
+    T_total = S_seq.shape[0]
+
+    def get_detJacs(element):
+        nodes_pos = nodes[element]
+        Jac = jnp.matmul(Bip_ele, nodes_pos)
+        ele_detJac_ = jnp.linalg.det(Jac)
+        return ele_detJac_
+    
+    ele_detJac = jax.vmap(get_detJacs)(elements)
+    
+    for t in range(0, T_total):
+        dt = 0.1 
+        current_time = t * dt
+        filename = os.path.join(out_dir, f"out_{t:04d}.vtk")
+        
+        S = S_seq[t]
+        T = T_seq[int(t*10)]   
+        
+        # Recompute activation masks at this time
+        active_element_inds = np.array(element_birth <= current_time)
+        active_node_inds = np.array(node_birth <= current_time)
+        n_e_save = int(np.sum(active_element_inds))
+        n_n_save = int(np.sum(active_node_inds))
+        
+        active_elements_list = elements[active_element_inds].tolist()
+        active_cells = np.array([item for sublist in active_elements_list for item in [8] + sublist])
+        active_cell_type = np.array([vtk.VTK_HEXAHEDRON] * len(active_elements_list))
+        
+        # points = np.array(nodes[0:n_n_save] + U[0:n_n_save])
+        points = np.array(nodes[0:n_n_save])
+        
+        Sv = transformation(np.sqrt(1/2 * ((S[0:n_e_save,:,0] - S[0:n_e_save,:,1])**2 + 
+                                        (S[0:n_e_save,:,1] - S[0:n_e_save,:,2])**2 + 
+                                        (S[0:n_e_save,:,2] - S[0:n_e_save,:,0])**2 + 
+                                        6 * (S[0:n_e_save,:,3]**2 + S[0:n_e_save,:,4]**2 + S[0:n_e_save,:,5]**2))), 
+                        elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S11 = transformation(S[0:n_e_save,:,0], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S22 = transformation(S[0:n_e_save,:,1], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S33 = transformation(S[0:n_e_save,:,2], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S12 = transformation(S[0:n_e_save,:,3], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S23 = transformation(S[0:n_e_save,:,4], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+        S13 = transformation(S[0:n_e_save,:,5], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
+    
+        # Using pyvista for vtk
+        active_grid = pv.UnstructuredGrid(active_cells, active_cell_type, points)
+        active_grid.point_data['temp'] = np.clip(np.array(T[0:n_n_save]), 300, 2300)
+        active_grid.point_data['S_von'] = np.array(Sv)
+        active_grid.point_data['S11'] = np.array(S11)
+        active_grid.point_data['S22'] = np.array(S22)
+        active_grid.point_data['S33'] = np.array(S33)
+        active_grid.point_data['S12'] = np.array(S12)
+        active_grid.point_data['S23'] = np.array(S23)
+        active_grid.point_data['S13'] = np.array(S13)
+        # active_grid.point_data['U1'] = np.array(U[0:n_n_save, 0])
+        # active_grid.point_data['U2'] = np.array(U[0:n_n_save, 1])
+        # active_grid.point_data['U3'] = np.array(U[0:n_n_save, 2])
+        active_grid.save(filename)
+
+def assemble_global_stiffness_matrix_jax(element_K, element_nodes, n_dof):
+    """
+    Assemble the global stiffness matrix from the element stiffness matrices using JAX.
+
+    Parameters:
+    - element_K: ndarray of shape (n_e, 24, 24), element stiffness matrices
+    - element_nodes: ndarray of shape (n_e, 8), node indices for each element
+    - n_n: int, number of nodes
+
+    Returns:
+    - K: ndarray of shape (n_n*3, n_n*3), global stiffness matrix
+    """
+    # Initialize global stiffness matrix
+    K = jnp.zeros((n_dof, n_dof))
+
+    def element_contribution(element_K, nodes):
+        nodes = nodes.astype(int)
+        dof_indices = jnp.repeat(nodes * 3, 3) + jnp.tile(jnp.arange(3), 8)       
+        idx = jnp.tile(dof_indices[:, None], (1, 24)).flatten()
+        idy = jnp.tile(dof_indices[None, :], (24, 1)).flatten()
+        return idx, idy, element_K.flatten()
+
+    # Vectorize element_contribution across all elements
+    idx, idy, values = jax.vmap(element_contribution)(element_K, element_nodes)
+    
+    # Flatten the results for indexing
+    idx = idx.flatten()
+    idy = idy.flatten()
+    values = element_K.flatten()
+
+    # Update the global stiffness matrix
+    K = K.at[idx, idy].add(values)
+    return K
+
 def mech(
     temperature,
     active_element_inds,
@@ -506,6 +667,7 @@ def mech(
     alpha_Th = jnp.zeros((n_e, n_q, 6)).at[:, :, 0:3].set(scl[:, :, None].repeat(3, axis=2))
     E_th = (temperature_ip[:, :, None].repeat(6, axis=2) - T_Ref) * alpha_Th
     E_th = E_th * mask_e[:, None, None]
+    jax.debug.print("🔎 E_th min/max = {mn}/{mx}", mn=jnp.nanmin(E_th), mx=jnp.nanmax(E_th))
     
     # Elastic matrices (computed for all elements)
     ele_K, ele_B, ele_D, ele_detJac = jax.vmap(
@@ -528,14 +690,30 @@ def mech(
         U_it, dU = state
 
         # 1) Compute strain E and stress S at Gauss points
-        E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)  
+        E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
+        jax.debug.print("🔎 E_base nan? {f}", f=jnp.any(jnp.isnan(E_base)))
+        
         E_corr = (E_base - E_th) * mask_e[:, None, None]
+        # S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+        
         S, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+        jax.debug.print("🔎 S nan? {f}", f=jnp.any(jnp.isnan(S)))
+        jax.debug.print("🔎 DS nan? {f}", f=jnp.any(jnp.isnan(DS)))
+        jax.debug.print("🔎 IND_p any True? {f}", f=jnp.any(IND_p))
 
         # 2) Tangent stiffness per element
         D_diff    = (ele_detJac[:, :, None, None] * DS) - ele_D
         B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)   # (n_e,24,24)
         K_tangent = ele_K + B_T_D_B                          # (n_e,24,24)
+        jax.debug.print("🔎 K_tangent norm = {n}", n=jnp.linalg.norm(K_tangent))
+        
+        # # # —— Stabilizer: for any element with mask_e==0, replace its 24×24 block by eps·I
+        # eps   = 1e-8
+        # eye24 = jnp.eye(24)[None, :, :]                       # shape (1,24,24)
+        # is_act = mask_e > 0.0                                 # boolean mask (n_e,)
+        # K_tangent = jnp.where(is_act[:, None, None],
+        #                       K_tangent,                     # active: use true tangent
+        #                       eps * eye24)                   # inactive: tiny identity
 
         # 3) Compute residual internal force F_node
         detS      = ele_detJac[..., None] * S               # (n_e,n_q,6)
@@ -544,6 +722,7 @@ def mech(
         elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e,8))
         F_node    = jnp.zeros((n_dof,))
         F_node    = F_node.at[elem_dofs.flatten()].add(F_e.flatten())
+        jax.debug.print("🔎 F_node nan? {f}", f=jnp.any(jnp.isnan(F_node)))
 
         # 4) Matrix‐free matvec for CG
         def mech_matvec(x):
@@ -571,11 +750,15 @@ def mech(
         # dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
         dU_flat, cg_state = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
 
+        jax.debug.print("🔎 dU_flat nan? {f}", f=jnp.any(jnp.isnan(dU_flat)))
+        jax.debug.print("🔎 final resid norm = {n}", n=jnp.linalg.norm(resid - mech_matvec(dU_flat)))
+        
         # 6) Un-flatten and update
         dU_new = dU_flat.reshape((n_n, 3))
         U_it   = U_it + dU_new
 
-        return jax.lax.stop_gradient((U_it, dU))
+        # return jax.lax.stop_gradient((U_it, dU))
+        return U_it, dU
         
     state0 = (U * mask_n[:, None], jnp.zeros_like(U))
     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
@@ -659,40 +842,30 @@ def simulate_mechanics(temperatures):
     return S_seq
 
 # --- Loss + Training ---
-def main_function(params, smooth_weight=1e-2):
+def main_function(params, target, smooth_weight=1e-2):
     control = jnp.concatenate([
         jnp.clip(params[:power_on_steps], 0.5, 2.0),
         jnp.zeros((steps - power_on_steps,))
     ], axis=0)
+
+    # jax.debug.print("control min {}", jnp.min(control))
+    # jax.debug.print("control max {}", jnp.max(control))
     
     smooth_penalty = smooth_weight * jnp.sum((params[1:] - params[:-1])**2)
     temperatures = simulate_temperature(control)
     S_seq = simulate_mechanics(temperatures)
 
-    # Compute final von Mises stress
-    S_final = S_seq[-1]  # shape: (n_e, n_q, 6)
+    # Pad S_seq if necessary
+    def pad_s(S): return jnp.pad(S, ((0, n_e - S.shape[0]), (0, 0), (0, 0)))
+    S_padded = jax.vmap(pad_s)(S_seq)
+    loss = jnp.mean((S_padded[:target.shape[0]] - target) ** 2)
     
-    # Von Mises stress (same as in save_vtk)
-    von_mises = jnp.sqrt(0.5 * (
-        (S_final[..., 0] - S_final[..., 1])**2 +
-        (S_final[..., 1] - S_final[..., 2])**2 +
-        (S_final[..., 2] - S_final[..., 0])**2 +
-        6 * (S_final[..., 3]**2 + S_final[..., 4]**2 + S_final[..., 5]**2)
-    ))
-    stress_loss = jnp.mean(von_mises)
-    
-    # Ensure all active nodes reached liquidus temperature at some point
-    T_max = jnp.max(temperatures, axis=0)  # shape: (n_nodes,)
-    T_deficit = jnp.clip(liquidus - T_max, a_min=0.0)
-    is_build = nodes[:, 2] > 0.0  # shape (n_nodes,)
-    melt_penalty = jnp.sum((T_deficit * is_build) ** 2) / jnp.sum(is_build)
-    
-    # Final total loss
-    loss = stress_loss + 10.0 * melt_penalty + smooth_penalty
+    # S_clipped = jnp.clip(S_padded, -1e2, 1e2)
+    # loss = jnp.mean((S_clipped[:target.shape[0]] - target) ** 2)
     
     return loss + smooth_penalty, control
 
-def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smooth_weight=1e-2):
+def train_model(params_init, target, num_iterations, output_dir, learning_rate=1e-3, smooth_weight=1e-2):
     # --- Optimizer ---
     optimizer = optax.adam(learning_rate)
     opt_state = optimizer.init(params_init)
@@ -707,9 +880,18 @@ def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smo
         print(f"\n--- Iteration {iteration} ---")
         start_time = time.time()
 
-        (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, smooth_weight)
+        # JAX-traced loss + gradient
+        (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target, smooth_weight)
+        # debug_main(params, target)
+        
+        any_nans = jax.tree_util.tree_leaves(grads)
+        any_nans = any(jnp.any(jnp.isnan(g)) for g in any_nans)
+        print("🚨 any NaNs in grads?", any_nans)
+        jax.debug.print("Loss: {}, grad_norm: {}", loss, optax.global_norm(grads))
+
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
+
         duration = time.time() - start_time
         print(f"Loss: {loss:.6f} | Time: {duration:.2f}s")
 
@@ -725,9 +907,69 @@ def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smo
 
     return params, loss_history, control_history
 
+def run_sin_target(output_path="./implicit_debug/Ss_target.npy"):
+    """
+    Run a forward pass using a sinusoidal control signal to generate target stress history.
+    Control varies between 0.75 and 1.25 as a sine wave over the power-on period.
+    """
+    # Sinusoidal control for power_on_steps, then zeros
+    t = jnp.linspace(0, jnp.pi * 2, power_on_steps)
+    control_signal = 1.0 + 0.25 * jnp.sin(t)  # range [0.75, 1.25]
+
+    control = jnp.concatenate([
+        control_signal,
+        jnp.zeros((steps - power_on_steps,))
+    ])
+
+    # Run forward simulations
+    t_start = time.time()
+    temperatures = simulate_temperature(control)
+    # temperatures.block_until_ready()  # <---- BLOCK HERE
+    t_end = time.time()
+    print(f"✅ Temp simulation finished in {t_end - t_start:.2f} seconds")
+    
+    t_start = time.time()
+    S_seq = simulate_mechanics(temperatures)
+    # S_seq.block_until_ready()  # <---- BLOCK HERE
+    t_end = time.time()
+    print(f"✅ Mech simulation finished in {t_end - t_start:.2f} seconds")
+
+    # Pad stress output to full shape
+    def pad_x(x): 
+        return jnp.pad(x, ((0, n_e - x.shape[0]), (0, 0), (0, 0)))
+    
+    t_start = time.time()
+    S_padded = jax.vmap(pad_x)(S_seq)
+    # S_padded.block_until_ready()  # <---- BLOCK HERE
+    np.save(output_path, np.array(S_padded))
+    t_end = time.time()
+    print(f"✅ Sinusoidal target saved to {output_path}, finished in {t_end - t_start:.2f} seconds")
+    
+    t_start = time.time()
+    save_vtk_2(temperatures, S_seq, elements, nodes, element_birth, node_birth, dt, out_dir="./vtk_out", stride=10)
+    t_end = time.time()
+    print(f"✅ Vtks saved to ./vtk_out, finished in {t_end - t_start:.2f} seconds")
+
+def debug_main(params, target):
+    (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, target)
+    # print whether loss is NaN
+    jax.debug.print("Loss: {loss}", loss = loss)
+
+    # walk the grads tree and print any NaN flags
+    def check_nan(g, path):
+        flag = jnp.any(jnp.isnan(g))
+        jax.debug.print("NaN?: {flag}, in grad at {path}", flag = flag, path=path)
+
+    jax.tree_util.tree_map_with_path(check_nan, grads)
+    return loss, control, grads
+
 # --- Simulation state containers ---
 ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
+
+# --- Config ---
+output_dir = "./implicit_debug"
+os.makedirs(output_dir, exist_ok=True)
 
 # Time and mesh
 steps = int(endTime / dt)
@@ -772,24 +1014,211 @@ temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
 scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
 temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
 
+# young1 = jnp.array(np.loadtxt('./0_properties/SS316L_Young.txt')[:, 1]) / 1e6
+# temp_young1 = jnp.array(np.loadtxt('./0_properties/SS316L_Young.txt')[:, 0])
+# Y1 = jnp.array(np.loadtxt('./0_properties/SS316L_Yield.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+# temp_Y1 = jnp.array(np.loadtxt('./0_properties/SS316L_Yield.txt')[:, 0])
+# scl1 = jnp.array(np.loadtxt('./0_properties/SS316L_Alpha.txt')[:, 1])
+# temp_scl1 = jnp.array(np.loadtxt('./0_properties/SS316L_Alpha.txt')[:, 0])
+
 T_Ref = ambient
 
 # Newton and CG tolerances
 tol = 1e-4
 cg_tol = 1e-4
-Maxit = 3
+# Maxit = 20
+Maxit = 1
 
+# Load stress target
+target = jnp.load(os.path.join(output_dir, "Ss_target.npy"))
+
+# Initialize control parameters
 params_init = jnp.ones((power_on_steps,)) * 1.0
 
+###
+
+# grad_params = jax.grad(lambda p: jax.value_and_grad(main_function, has_aux=True)(p, target)[0])(params_init)
+# print("Any NaNs in full ∂loss/∂params? ", bool(jnp.any(jnp.isnan(grad_params))))
+# print("grad norm:", jnp.linalg.norm(grad_params))
+
+###
+
+###
+
+# # Compute both (loss, control) and grads in one shot:
+# (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params_init, target)
+
+# # Now grads is exactly ∂loss/∂params.  You can inspect it:
+# any_nans = jax.tree_util.tree_leaves(grads)
+# any_nans = any(jnp.any(jnp.isnan(g)) for g in any_nans)
+# print("🚨 any NaNs in grads?", any_nans)
+
+###
+
+###
+
+# train_model(
+#         params_init=params_init,
+#         target=target,
+#         num_iterations=3,
+#         output_dir=output_dir,
+#         learning_rate=1e-3,
+#         smooth_weight=1e-2
+#     )
+
+###
+
 if __name__ == "__main__":
+    if "forward" in sys.argv:
+        run_sin_target()
+        exit()
+
+    # Otherwise, run training
+    
     t_start = time.time()
+
+    
     trained_params, loss_history, control_history = train_model(
         params_init=params_init,
-        num_iterations=500,
+        target=target,
+        num_iterations=3,
         output_dir=output_dir,
-        learning_rate=1e-2,
+        learning_rate=1e-3,
         smooth_weight=1e-2
     )
     
     t_end = time.time()
     print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
+
+# --------------------------------------------
+# DEBUG: single‐element sanity check
+# --------------------------------------------
+
+def debug_one_element():
+    # pick element #0 only
+    # elements_1 = elements[0:1]                # shape (1,8)
+    active_element_inds = jnp.array([1.0])              # keep that element “on”
+    active_node_inds    = jnp.ones((n_n,))              # all nodes alive so we don’t clamp anything
+    # initial mech state for that one element
+    U0       = jnp.zeros((n_n, 3))
+    E0       = jnp.zeros((1, n_q, 6))
+    Ep0      = jnp.zeros((1, n_q, 6))
+    Hard0    = jnp.zeros((1, n_q, 6))
+    dU0      = jnp.zeros((n_n, 3))
+    T0       = jnp.full((n_n,), ambient)               # constant ambient temp
+
+    # call your mech right now, for element 0 at time=0.0
+    S, U1, E1, Ep1, Hard1, dU1 = mech(
+        temperature       = T0,
+        active_element_inds = active_element_inds,
+        active_node_inds    = active_node_inds,
+        U                  = U0,
+        E                  = E0,
+        Ep_prev            = Ep0,
+        Hard_prev          = Hard0,
+        dU                 = dU0,
+        current_time       = 0.0,
+    )
+
+    # Dump out the raw element stress + displacement increment
+    print("S (1×8×6):\n", S)
+    print("S shape :\n", S.shape)
+    print("dU norm:", jnp.linalg.norm(dU1))
+
+def single_elem_loss(T0):
+    # call mech exactly as in debug_one_element
+    S, U1, E1, Ep1, Hard1, dU1 = mech(
+        temperature         = T0,
+        active_element_inds = jnp.array([1.0]),
+        active_node_inds    = jnp.ones((n_n,)),
+        U                   = jnp.zeros((n_n,3)),
+        E                   = jnp.zeros((1,n_q,6)),
+        Ep_prev             = jnp.zeros((1,n_q,6)),
+        Hard_prev           = jnp.zeros((1,n_q,6)),
+        dU                  = jnp.zeros((n_n,3)),
+        current_time        = 0.0,
+    )
+    # pick a simple scalar: sum of all stress entries
+    return jnp.sum(S)
+
+###
+
+# debug_one_element()
+# grad_T0 = jax.grad(single_elem_loss)(jnp.full((n_n,), ambient))
+
+# # inspect if any entry is NaN
+# print("any NaNs in ∂loss/∂T0? ", bool(jnp.any(jnp.isnan(grad_T0))))
+# print("grad_T0 norm:", jnp.linalg.norm(grad_T0))
+
+###
+
+# # Re-use your single-element setup
+# T0 = jnp.full((n_n,), ambient)
+# ae = jnp.array([1.0])
+# an = jnp.ones((n_n,))
+
+# U0    = jnp.zeros((n_n,3))
+# E0    = jnp.zeros((1,n_q,6))
+# Ep0   = jnp.zeros((1,n_q,6))
+# Hard0 = jnp.zeros((1,n_q,6))
+# dU0   = jnp.zeros((n_n,3))
+
+# # Define a function that returns the element stress S (shape (1,8,6))
+# def S_fn(T):
+#     S, *_ = mech(
+#         temperature         = T,
+#         active_element_inds = ae,
+#         active_node_inds    = an,
+#         U                   = U0,
+#         E                   = E0,
+#         Ep_prev             = Ep0,
+#         Hard_prev           = Hard0,
+#         dU                  = dU0,
+#         current_time        = 0.0,
+#     )
+#     return S  # shape (1,8,6)
+
+# # 1) Compute the full Jacobian dS/dT
+# J = jax.jacrev(S_fn)(T0)   # shape (1,8,6, n_n)
+# print("any NaNs in dS/dT?", bool(jnp.any(jnp.isnan(J))))
+# print("J shape:", J.shape)
+
+# # 2) Or get the gradient of sum(S) w.r.t T via a VJP
+# #    (equivalent to your single_elem_loss, but lets you inspect the raw vector)
+# S0, pullback = jax.vjp(S_fn, T0)
+# gradT, = pullback(jnp.ones_like(S0))  # shape (n_n,)
+# print("any NaNs in ∂sum(S)/∂T?", bool(jnp.any(jnp.isnan(gradT))))
+# print("gradT norm:", jnp.linalg.norm(gradT))
+
+###
+
+# # --- re‐use your debug_one_element setup to get these values ---
+
+# temperature_ip = jnp.ones((1, n_q)) * 300    # shape (1, n_q) from your debug run
+# E_corr         = jnp.zeros((1, n_q, 6))    # since U=0 and E_th=0
+# Ep_prev        = jnp.zeros((1, n_q, 6))
+# Hard_prev      = jnp.zeros((1, n_q, 6))
+# shear          = jnp.interp(temperature_ip, temp_young1, young1) \
+#                     /(2*(1+poisson))
+# bulk           = jnp.interp(temperature_ip, temp_young1, young1) \
+#                     /(3*(1-2*poisson))
+# Y              = jnp.interp(temperature_ip, temp_Y1, Y1)
+# a              = a1 * jnp.ones_like(shear)
+
+# # build a standalone function that returns the scalar sum of all stress components
+# def S_constitutive_flat(E_flat):
+#     # reshape back to (1,n_q,6)
+#     E3 = E_flat.reshape((1, n_q, 6))
+#     S, DS, IND_p, Ep, Hard = constitutive_problem(
+#         E3, Ep_prev, Hard_prev, shear, bulk, a, Y
+#     )
+#     return jnp.sum(S)
+
+# # flatten E_corr and take its gradient
+# E_flat = E_corr.flatten()
+# grad_E = jax.grad(S_constitutive_flat)(E_flat)
+
+# # print("⧗ any NaNs in ∂S/∂E_corr? ", bool(jnp.any(jnp.isnan(grad_E))))
+# print("NaNs in ∂S/∂E_corr after clamp?", bool(jnp.any(jnp.isnan(grad_E))))
+
+###

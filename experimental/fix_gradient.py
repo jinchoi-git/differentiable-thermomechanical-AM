@@ -14,13 +14,14 @@ import jax.experimental.sparse as jsp
 from collections import namedtuple
 from tqdm import trange
 from functools import partial
+from jax import custom_vjp, linear_transpose
 
 np.bool = np.bool_
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 # jax.config.update("jax_enable_x64", True)
 
 # --- Config ---
-output_dir = "./minimize_stress_lr1e2"
+output_dir = "./check_gradient_lr1e2"
 os.makedirs(output_dir, exist_ok=True)
 
 '''
@@ -467,6 +468,142 @@ def transformation(Q_int, active_elements, ele_detJac, n_n_save):
     
     return Q_node
 
+# --- implicit-function theorem solver via custom_vjp ---
+import jax
+import jax.numpy as jnp
+from jax import custom_vjp, linear_transpose
+from jax.scipy.sparse.linalg import cg
+
+# 1) The plain forward implementation, no decorators:
+def _solve_mechanical_impl(
+    U0, Ep_prev, Hard_prev,
+    shear, bulk, alpha_vals, yield_strength,
+    E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+    elements, elem_dofs, Q_dof, mask_e,
+    cg_tol, Maxit
+):
+    # U0 shape (n_n,3)
+    def newton_step(i, U_it):
+        # a) compute stress & tangent
+        E_base = jax.vmap(compute_E, in_axes=(0,0,None))(elements, ele_B, U_it)
+        E_corr = (E_base - E_th) * mask_e[:,None,None]
+        S, DS, *_ = constitutive_problem(
+            E_corr, Ep_prev, Hard_prev,
+            shear, bulk, alpha_vals, yield_strength
+        )
+        D_diff    = (ele_detJac[...,None,None] * DS) - ele_D
+        B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)
+        K_tangent = ele_K + B_T_D_B
+
+        # b) build matvec closing over K_tangent
+        def mech_matvec(x):
+            y0 = jnp.zeros_like(Q_dof)
+            def mv_body(y_acc, e_idx):
+                Ke   = K_tangent[e_idx] * mask_e[e_idx]
+                dofs = elem_dofs[e_idx]
+                return y_acc.at[dofs].add(Ke @ x[dofs]), None
+            y, _ = jax.lax.scan(mv_body, y0, jnp.arange(elements.shape[0]))
+            return Q_dof * y * Q_dof
+
+        # c) build residual
+        detS  = ele_detJac[...,None] * S
+        F_e   = jnp.einsum("eqik,eqk->ei", B_T, detS) * mask_e[:,None]
+        resid = -jnp.zeros_like(Q_dof).at[elem_dofs.flatten()].add(F_e.flatten()) * Q_dof
+
+        # d) CG solve (implicit VJP)
+        dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
+        dU_new     = dU_flat.reshape(U_it.shape)
+
+        return U_it + dU_new
+
+    U_star = jax.lax.fori_loop(0, Maxit, newton_step, U0)
+    dU_star = U_star - U0
+    return U_star, dU_star
+
+# 2) Attach a custom VJP to that helper:
+solve_mechanical = custom_vjp(_solve_mechanical_impl)
+
+def solve_mechanical_fwd(
+    U0, Ep_prev, Hard_prev,
+    shear, bulk, alpha_vals, yield_strength,
+    E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+    elements, elem_dofs, Q_dof, mask_e,
+    cg_tol, Maxit
+):
+    # Run the plain forward
+    U_star, dU_star = _solve_mechanical_impl(
+        U0, Ep_prev, Hard_prev,
+        shear, bulk, alpha_vals, yield_strength,
+        E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+        elements, elem_dofs, Q_dof, mask_e,
+        cg_tol, Maxit
+    )
+    # Residuals: everything we need to reassemble F(U) in backward
+    res = (
+        Ep_prev, Hard_prev,
+        shear, bulk, alpha_vals, yield_strength,
+        E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+        elements, elem_dofs, Q_dof, mask_e,
+        cg_tol, Maxit,
+        U_star
+    )
+    return (U_star, dU_star), res
+
+def solve_mechanical_bwd(res, g):
+    (
+      Ep_prev, Hard_prev,
+      shear, bulk, alpha_vals, yield_strength,
+      E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+      elements, elem_dofs, Q_dof, mask_e,
+      cg_tol, Maxit,
+      U_star,
+    ) = res
+    gU, gdU = g   # both shape (n_n,3)
+
+    # 1) Flatten the cotangent for U* into the cotangent of the residual:
+    gF = gU.reshape(-1)  # shape (n_dof,)
+
+    # 2) Recompute the tangent stiffness at U_star:
+    E_base = jax.vmap(compute_E, in_axes=(0,0,None))(elements, ele_B, U_star)
+    E_corr = (E_base - E_th) * mask_e[:, None, None]
+    # reuse your constitutive update:
+    S, DS, *_ = constitutive_problem(
+        E_corr, Ep_prev, Hard_prev,
+        shear, bulk, alpha_vals, yield_strength
+    )
+    D_diff    = (ele_detJac[...,None,None] * DS) - ele_D
+    B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)
+    K_tangent = ele_K + B_T_D_B  # shape (n_e, 24, 24)
+
+    # 3) Build the *linear* matvec using this fixed K_tangent:
+    def mech_matvec_linear(x):
+        y0 = jnp.zeros((n_dof,))
+        def mv_body(y_acc, e_idx):
+            Ke   = K_tangent[e_idx] * mask_e[e_idx]      # (24×24)
+            dofs = elem_dofs[e_idx]                     # (24,)
+            return y_acc.at[dofs].add(Ke @ x[dofs]), None
+        y, _ = jax.lax.scan(mv_body, y0, jnp.arange(elements.shape[0]))
+        return Q_dof * y * Q_dof
+
+    # 4) Solve K_tangent^T v = gF with CG (uses built‐in implicit‐IFT):
+    v_flat, _ = cg(mech_matvec_linear, gF, x0=jnp.zeros_like(gF), tol=cg_tol)
+    v = v_flat.reshape(U_star.shape)  # back to (n_n,3)
+
+    # 5) Combine the two gradient paths:
+    #    - Implicit‐IFT through F(U)=0 gives:           -v
+    #    - Direct path through dU_star = U_star - U0 gives: -gdU
+    dU0 = -v - gdU
+
+    # 6) Return gradient only for U0; all other args get None
+    return (dU0,) + (None,) * (len(res) - 1)
+
+
+# Bind the rules
+solve_mechanical.defvjp(solve_mechanical_fwd, solve_mechanical_bwd)
+
+n_n   = nodes.shape[0] 
+n_dof = int(n_n * 3)
+
 def mech(
     temperature,
     active_element_inds,
@@ -478,116 +615,65 @@ def mech(
     dU,
     current_time,
 ):
-    
     # Masks
     mask_e = active_element_inds                # (n_e,)
     mask_n = active_node_inds                   # (n_n,)
     n_n_active = jnp.sum(mask_n).astype(jnp.int32)
-    n_dof = n_n * 3
-    
-    # If new layer is added, interpolate displacements for new nodes
-    # U = disp_match(nodes, U, n_n_old)
+    elem_dofs = (elements[..., None] * 3 + jnp.arange(3)).reshape(n_e, -1)
 
-    # # Interpolate temperature at integration points
+    # Interpolate temperature at integration points
     temperature_ip = (
-        Nip_ele[:, jnp.newaxis, :] @ temperature[elements][:, jnp.newaxis, :, jnp.newaxis].repeat(8, axis=1)
+        Nip_ele[:, jnp.newaxis, :]
+        @ temperature[elements][:, jnp.newaxis, :, jnp.newaxis].repeat(8, axis=1)
     )[:, :, 0, 0]
     temperature_ip = jnp.clip(temperature_ip, 300, 2300)
-       
+
     # Material properties
     young = jnp.interp(temperature_ip, temp_young1, young1)
     shear = young / (2 * (1 + poisson))
     bulk = young / (3 * (1 - 2 * poisson))
     scl = jnp.interp(temperature_ip, temp_scl1, scl1)
-    Y = jnp.interp(temperature_ip, temp_Y1, Y1)
-    a = a1 * jnp.ones_like(young)
+    yield_strength = jnp.interp(temperature_ip, temp_Y1, Y1)
+    alpha_vals = a1 * jnp.ones_like(young)
 
     # Thermal strain
     alpha_Th = jnp.zeros((n_e, n_q, 6)).at[:, :, 0:3].set(scl[:, :, None].repeat(3, axis=2))
     E_th = (temperature_ip[:, :, None].repeat(6, axis=2) - T_Ref) * alpha_Th
     E_th = E_th * mask_e[:, None, None]
-    
-    # Elastic matrices (computed for all elements)
+
+    # Elastic element matrices
     ele_K, ele_B, ele_D, ele_detJac = jax.vmap(
         elastic_stiff_matrix, in_axes=(0, None, None, 0, 0)
     )(elements, nodes, Bip_ele, shear, bulk)
-
-    # Zero out inactive elements
     ele_K      = ele_K * mask_e[:, None, None]
     ele_B      = ele_B * mask_e[:, None, None, None]
     ele_D      = ele_D * mask_e[:, None, None, None]
     ele_detJac = ele_detJac * mask_e[:, None]
-
     B_T = jnp.transpose(ele_B, (0, 1, 3, 2))  # (n_e, 8, 24, 6)
-    
+
     # Dirichlet BC mask at DOF level
     Q_node = jnp.where(nodes[:, 2] < -2.9, 0.0, 1.0) * mask_n   # (n_n,)
     Q_dof  = jnp.repeat(Q_node, 3)                              # (n_dof,)
 
-    def newton_iteration(i, state):
-        U_it, dU = state
+    # Call the new solver in place of the old loop + stop_gradient
+    U0 = U * mask_n[:, None]
+    U_it, dU = solve_mechanical(
+        U0, Ep_prev, Hard_prev,
+        shear, bulk, alpha_vals, yield_strength,
+        E_th, ele_B, ele_D, ele_K, ele_detJac, B_T,
+        elements, elem_dofs, Q_dof, mask_e,
+        cg_tol, Maxit
+    )
 
-        # 1) Compute strain E and stress S at Gauss points
-        E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)  
-        E_corr = (E_base - E_th) * mask_e[:, None, None]
-        S, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
-
-        # 2) Tangent stiffness per element
-        D_diff    = (ele_detJac[:, :, None, None] * DS) - ele_D
-        B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)   # (n_e,24,24)
-        K_tangent = ele_K + B_T_D_B                          # (n_e,24,24)
-
-        # 3) Compute residual internal force F_node
-        detS      = ele_detJac[..., None] * S               # (n_e,n_q,6)
-        F_e       = jnp.einsum("eqik,eqk->ei", B_T, detS)    # (n_e,24)
-        F_e       = F_e * mask_e[:, None]
-        elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e,8))
-        F_node    = jnp.zeros((n_dof,))
-        F_node    = F_node.at[elem_dofs.flatten()].add(F_e.flatten())
-
-        # 4) Matrix‐free matvec for CG
-        def mech_matvec(x):
-            y0 = jnp.zeros_like(x)  # global accumulator
-        
-            def body(y_accum, e_idx):
-                # 1) zero‐out inactive element
-                Ke = K_tangent[e_idx] * mask_e[e_idx]      # (24×24)
-                # Ke = K_tangent[e_idx]                        # (24×24)
-                dofs = elem_dofs[e_idx]                    # (24,)
-                local_x = x[dofs]                          # (24,)
-                local_y = Ke @ local_x                     # (24,)
-                # 2) scatter‐add
-                y_accum = y_accum.at[dofs].add(local_y)
-                return y_accum, None   # <-- now returns (carry, out)
-
-            # Scan over elements:
-            y, _ = jax.lax.scan(body, y0, jnp.arange(n_e))
-        
-            # Enforce Dirichlet rows & columns:
-            return Q_dof * y * Q_dof  # shape (n_dof,)
-
-        # 5) Solve for increment dU in flattened form
-        resid     = -F_node * Q_dof
-        # dU_flat, _ = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
-        dU_flat, cg_state = cg(mech_matvec, resid, x0=jnp.zeros_like(resid), tol=cg_tol)
-
-        # 6) Un-flatten and update
-        dU_new = dU_flat.reshape((n_n, 3))
-        U_it   = U_it + dU_new
-
-        return jax.lax.stop_gradient((U_it, dU))
-        
-    state0 = (U * mask_n[:, None], jnp.zeros_like(U))
-    U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
-
-    # Final stress for output
+    # Final stress for output (unchanged)
     E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
     E_corr = (E_base - E_th) * mask_e[:, None, None]
-    S_final, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
-    
-    # Update global U
-    U = jax.lax.dynamic_update_slice(U, U_it, (0, 0))
+    S_final, DS, IND_p, Ep_new, Hard_new = constitutive_problem(
+        E_corr, Ep_prev, Hard_prev, shear, bulk, alpha_vals, yield_strength
+    )
 
+    U = jax.lax.dynamic_update_slice(U, U_it, (0, 0))
+    
     return (
         S_final,
         U,
@@ -596,6 +682,7 @@ def mech(
         Hard_new,
         dU,
     )
+
 
 # --- Thermal simulation ---
 def simulate_temperature(control):
@@ -725,6 +812,53 @@ def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smo
 
     return params, loss_history, control_history
 
+def grad_check(params, eps=1e-3, n_checks=5):
+    """
+    Compare JAX autodiff gradient of main_function to central finite differences.
+
+    Args:
+      params: 1D numpy array of initial control parameters.
+      eps:    Finite‐difference step size.
+      n_checks: Number of parameters (from index 0) to compare.
+
+    Returns:
+      A NumPy array of shape (n_checks, 4) with columns:
+        [analytic_grad, numeric_grad, abs_error, rel_error].
+    """
+    # Define a pure‐Python loss function wrapper
+    def loss_fn(p):
+        # main_function returns (loss, control); we differentiate w.r.t. loss only
+        return main_function(jnp.array(p))[0]
+
+    # Compute analytic gradient via JAX
+    analytic_grad = np.array(jax.grad(loss_fn)(jnp.array(params)))
+
+    # Compute numeric gradient via central finite difference
+    numeric_grad = np.zeros_like(analytic_grad)
+    for i in range(n_checks):
+        p_plus  = params.copy();  p_plus[i]  += eps
+        p_minus = params.copy();  p_minus[i] -= eps
+        f_plus  = float(loss_fn(p_plus))
+        f_minus = float(loss_fn(p_minus))
+        numeric_grad[i] = (f_plus - f_minus) / (2 * eps)
+
+    # Build comparison table
+    table = []
+    for i in range(n_checks):
+        ag = analytic_grad[i]
+        ng = numeric_grad[i]
+        err = abs(ag - ng)
+        rel = err / (abs(ng) + 1e-8)
+        table.append((i, ag, ng, err, rel))
+
+    # Print results
+    print(f"{'idx':>3} │ {'analytic':>12} │ {'numeric':>12} │ {'abs err':>10} │ {'rel err':>10}")
+    print("─────┼" + "─"*14 + "┼" + "─"*14 + "┼" + "─"*12 + "┼" + "─"*12)
+    for idx, ag, ng, err, rel in table:
+        print(f"{idx:3d} │ {ag:12.6e} │ {ng:12.6e} │ {err:10.2e} │ {rel:10.2e}")
+
+    return np.array(table)
+
 # --- Simulation state containers ---
 ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
@@ -781,15 +915,9 @@ Maxit = 3
 
 params_init = jnp.ones((power_on_steps,)) * 1.0
 
-if __name__ == "__main__":
-    t_start = time.time()
-    trained_params, loss_history, control_history = train_model(
-        params_init=params_init,
-        num_iterations=500,
-        output_dir=output_dir,
-        learning_rate=1e-2,
-        smooth_weight=1e-2
-    )
-    
-    t_end = time.time()
-    print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
+if __name__ == "__main__":   
+    # Load or initialize your starting parameters (must match power_on_steps length)
+    import numpy as onp
+    init_params = onp.ones((power_on_steps,))    
+    # Run the gradient check for the first 5 parameters
+    grad_check(init_params, eps=1e-3, n_checks=5)

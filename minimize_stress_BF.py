@@ -14,13 +14,14 @@ import jax.experimental.sparse as jsp
 from collections import namedtuple
 from tqdm import trange
 from functools import partial
+from scipy.optimize import minimize
 
 np.bool = np.bool_
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 # jax.config.update("jax_enable_x64", True)
 
 # --- Config ---
-output_dir = "./minimize_stress_lr1e2"
+output_dir = "./minimize_stress_BF_fix"
 os.makedirs(output_dir, exist_ok=True)
 
 '''
@@ -692,38 +693,70 @@ def main_function(params, smooth_weight=1e-2):
     
     return loss + smooth_penalty, control
 
-def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smooth_weight=1e-2):
-    # --- Optimizer ---
-    optimizer = optax.adam(learning_rate)
-    opt_state = optimizer.init(params_init)
-    params = params_init
+main_function_jit = jax.jit(main_function)
 
+def train_model(params_init, output_dir, smooth_weight=1e-2):
+    """
+    Train model using L-BFGS-B optimizer with parameter and loss history saving.
+    """
+
+    # Bounds for each parameter
+    bounds = [(0.5, 2.0)] * len(params_init)
+
+    # History trackers
     loss_history = []
     control_history = []
 
+    # Define loss function
+    def loss_fn(params_np):
+        params = jnp.array(params_np)
+        loss, control = main_function_jit(params, smooth_weight)
+        loss_value = float(loss)
+        return loss_value
+
+    # Callback to save history at each iteration
+    def callback(params_np):
+        params = jnp.array(params_np)
+        loss, control = main_function_jit(params, smooth_weight)
+        loss_value = float(loss)
+
+        # Save to history
+        loss_history.append(loss_value)
+        control_history.append(np.array(control))
+
+        print(f"Loss: {loss_value:.6f}")
+
+        # Save intermediate results every 10 steps
+        if len(loss_history) % 1 == 0:
+            np.save(os.path.join(output_dir, f"params_{len(loss_history):04d}.npy"), np.array(params))
+            np.save(os.path.join(output_dir, f"control_{len(loss_history):04d}.npy"), np.array(control))
+            np.save(os.path.join(output_dir, f"loss_{len(loss_history):04d}.npy"), np.array(loss_history))
+
+    # Start timer
+    t_start = time.time()
+
+    print("\n--- Starting L-BFGS-B Optimization ---")
+    result = minimize(
+        loss_fn,
+        x0=np.array(params_init),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': 50, 'disp': True, 'maxfun': 10},
+        callback=callback
+    )
+
+    t_end = time.time()
+    print(f"✅ Optimization completed in {t_end - t_start:.2f} seconds")
+    print(f"Final Loss: {result.fun}")
+
+    # Save final results
     os.makedirs(output_dir, exist_ok=True)
+    np.save(os.path.join(output_dir, "params_final.npy"), result.x)
+    np.save(os.path.join(output_dir, "loss_final.npy"), result.fun)
+    np.save(os.path.join(output_dir, "loss_history.npy"), np.array(loss_history))
+    np.save(os.path.join(output_dir, "control_history.npy"), np.array(control_history))
 
-    for iteration in range(num_iterations):
-        print(f"\n--- Iteration {iteration} ---")
-        start_time = time.time()
-
-        (loss, control), grads = jax.value_and_grad(main_function, has_aux=True)(params, smooth_weight)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        duration = time.time() - start_time
-        print(f"Loss: {loss:.6f} | Time: {duration:.2f}s")
-
-        # Save logs
-        loss_history.append(loss)
-        control_history.append(control)
-
-        if iteration % 10 == 0:
-            # Save parameters
-            np.save(os.path.join(output_dir, f"params_{iteration:04d}.npy"), np.array(params))
-            np.save(os.path.join(output_dir, f"control_{iteration:04d}.npy"), np.array(control))
-            np.save(os.path.join(output_dir, f"loss_{iteration:04d}.npy"), np.array(loss_history))
-
-    return params, loss_history, control_history
+    return result.x, loss_history, control_history
 
 # --- Simulation state containers ---
 ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
@@ -785,11 +818,8 @@ if __name__ == "__main__":
     t_start = time.time()
     trained_params, loss_history, control_history = train_model(
         params_init=params_init,
-        num_iterations=500,
         output_dir=output_dir,
-        learning_rate=1e-2,
         smooth_weight=1e-2
     )
-    
     t_end = time.time()
-    print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
+    print(f"? Total Time: {t_end - t_start:.2f} seconds")

@@ -16,11 +16,11 @@ from tqdm import trange
 from functools import partial
 
 np.bool = np.bool_
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 # jax.config.update("jax_enable_x64", True)
 
 # --- Config ---
-output_dir = "./minimize_stress_lr1e2"
+output_dir = "./check_gradient_lr1e2"
 os.makedirs(output_dir, exist_ok=True)
 
 '''
@@ -575,7 +575,9 @@ def mech(
         dU_new = dU_flat.reshape((n_n, 3))
         U_it   = U_it + dU_new
 
-        return jax.lax.stop_gradient((U_it, dU))
+        # return jax.lax.stop_gradient((U_it, dU))
+        return (U_it, dU)
+
         
     state0 = (U * mask_n[:, None], jnp.zeros_like(U))
     U_it, dU = jax.lax.fori_loop(0, Maxit, newton_iteration, state0)
@@ -725,6 +727,53 @@ def train_model(params_init, num_iterations, output_dir, learning_rate=1e-3, smo
 
     return params, loss_history, control_history
 
+def grad_check(params, eps=1e-3, n_checks=5):
+    """
+    Compare JAX autodiff gradient of main_function to central finite differences.
+
+    Args:
+      params: 1D numpy array of initial control parameters.
+      eps:    Finite‐difference step size.
+      n_checks: Number of parameters (from index 0) to compare.
+
+    Returns:
+      A NumPy array of shape (n_checks, 4) with columns:
+        [analytic_grad, numeric_grad, abs_error, rel_error].
+    """
+    # Define a pure‐Python loss function wrapper
+    def loss_fn(p):
+        # main_function returns (loss, control); we differentiate w.r.t. loss only
+        return main_function(jnp.array(p))[0]
+
+    # Compute analytic gradient via JAX
+    analytic_grad = np.array(jax.grad(loss_fn)(jnp.array(params)))
+
+    # Compute numeric gradient via central finite difference
+    numeric_grad = np.zeros_like(analytic_grad)
+    for i in range(n_checks):
+        p_plus  = params.copy();  p_plus[i]  += eps
+        p_minus = params.copy();  p_minus[i] -= eps
+        f_plus  = float(loss_fn(p_plus))
+        f_minus = float(loss_fn(p_minus))
+        numeric_grad[i] = (f_plus - f_minus) / (2 * eps)
+
+    # Build comparison table
+    table = []
+    for i in range(n_checks):
+        ag = analytic_grad[i]
+        ng = numeric_grad[i]
+        err = abs(ag - ng)
+        rel = err / (abs(ng) + 1e-8)
+        table.append((i, ag, ng, err, rel))
+
+    # Print results
+    print(f"{'idx':>3} │ {'analytic':>12} │ {'numeric':>12} │ {'abs err':>10} │ {'rel err':>10}")
+    print("─────┼" + "─"*14 + "┼" + "─"*14 + "┼" + "─"*12 + "┼" + "─"*12)
+    for idx, ag, ng, err, rel in table:
+        print(f"{idx:3d} │ {ag:12.6e} │ {ng:12.6e} │ {err:10.2e} │ {rel:10.2e}")
+
+    return np.array(table)
+
 # --- Simulation state containers ---
 ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
@@ -781,15 +830,9 @@ Maxit = 3
 
 params_init = jnp.ones((power_on_steps,)) * 1.0
 
-if __name__ == "__main__":
-    t_start = time.time()
-    trained_params, loss_history, control_history = train_model(
-        params_init=params_init,
-        num_iterations=500,
-        output_dir=output_dir,
-        learning_rate=1e-2,
-        smooth_weight=1e-2
-    )
-    
-    t_end = time.time()
-    print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
+if __name__ == "__main__":   
+    # Load or initialize your starting parameters (must match power_on_steps length)
+    import numpy as onp
+    init_params = onp.ones((power_on_steps,))    
+    # Run the gradient check for the first 5 parameters
+    grad_check(init_params, eps=1e-3, n_checks=1)
