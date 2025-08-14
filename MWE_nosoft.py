@@ -10,7 +10,7 @@ from collections import namedtuple
 import functools
 np.bool = np.bool_
 
-sys.path.append('./includes')
+sys.path.append('./includes_nosoft')
 from data_loader import load_toolpath, shape_fnc_element, derivate_shape_fnc_element, shape_fnc_surface, derivate_shape_fnc_surface, surface_jacobian
 from thermal import update_birth, calc_cp, update_mvec_stiffness, update_fluxes
 from mech import elastic_stiff_matrix, constitutive_problem, compute_E
@@ -85,9 +85,10 @@ def mech(
     temperature_ip = (
         Nip_ele[:, jnp.newaxis, :] @ temperature[elements][:, jnp.newaxis, :, jnp.newaxis].repeat(8, axis=1)
     )[:, :, 0, 0]
-    tau = 20.0  # smaller = sharper clamp
-    temperature_ip = temperature_ip - tau * jax.nn.softplus((temperature_ip - 2300.0) / tau)
-       
+    # tau = 20.0  # smaller = sharper clamp
+    # temperature_ip = temperature_ip - tau * jax.nn.softplus((temperature_ip - 2300.0) / tau)
+    temperature_ip = jnp.clip(temperature_ip, 300, 2300)
+
     # Material properties (constants)
     young = jnp.full_like(temperature_ip, young1)
     shear = young / (2 * (1 + poisson))
@@ -204,7 +205,7 @@ def simulate_temperature(control):
         rhs = jnp.zeros(n_n)
         m_vec, rhs = update_mvec_stiffness(m_vec, rhs, cps, conds, elements, temperature, ae, an, nodes, Bip_ele, Nip_ele, density)
         rhs = update_fluxes(t, rhs, temperature, base_power, control_t, asurf,
-                  surfaces, surf_detJacs, surface_xy, surface_flux, Nip_sur, nodes, laser_loc, laser_on[t], r_beam, h_conv, ambient, h_rad)
+                  surfaces, surf_detJacs, surface_xy, surface_flux, Nip_sur, nodes, laser_loc, laser_on, r_beam, h_conv, ambient, h_rad)
 
         update = dt * rhs / (m_vec + 1e-8) * an    
         
@@ -214,8 +215,8 @@ def simulate_temperature(control):
                        
         return (temperature, temperatures), None
 
-    t_seq = jnp.arange(0, steps)
-    control_seq = control
+    t_seq = jnp.arange(1, steps)
+    control_seq = control[:-1]
     carry = (
         jnp.full((n_n,), ambient),
         jnp.full((steps, n_n), ambient)
@@ -247,64 +248,95 @@ def simulate_mechanics(temperatures):
         dU=jnp.zeros((n_n, 3)),
     )
 
-    mech_timesteps = jnp.arange(0, steps, 10)
+    mech_timesteps = jnp.arange(1, steps, 10)
     final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     
     return S_seq
 
 # --- Loss + Training ---
-def smooth_max_time(T, alpha=20.0, axis=0):
-    # T: (time, space)
-    return jax.nn.logsumexp(alpha * T, axis=axis) / alpha
+# def smooth_max_time(T, alpha=20.0, axis=0):
+#     # T: (time, space)
+#     return jax.nn.logsumexp(alpha * T, axis=axis) / alpha
 
-def soft_relu(x, beta=20.0):
-    # smooth max(x,0)
-    return jax.nn.softplus(beta * x) / beta
+# def soft_relu(x, beta=20.0):
+#     # smooth max(x,0)
+#     return jax.nn.softplus(beta * x) / beta
 
-def melt_loss_fn(
-    temperatures,          # (T, S)
-    liquidus,              # scalar or (S,)
-    active_mask=None,      # None or (S,) in {0,1}
-    alpha=20.0,            # sharpness for smooth max
-    beta=20.0,             # sharpness for soft ReLU
-    margin=0.0,            # require T_max >= liquidus + margin
-    huber_delta=None       # None -> pure L2; else Huber for stability
-):
-    T_max = smooth_max_time(temperatures, alpha=alpha, axis=0)     # (S,)
-    # deficit is positive only if we failed to reach the threshold
-    deficit = soft_relu((liquidus + margin) - T_max, beta=beta)  # (S,)
+# def melt_loss_fn(
+#     temperatures,          # (T, S)
+#     liquidus,              # scalar or (S,)
+#     active_mask=None,      # None or (S,) in {0,1}
+#     alpha=20.0,            # sharpness for smooth max
+#     beta=20.0,             # sharpness for soft ReLU
+#     margin=0.0,            # require T_max >= liquidus + margin
+#     huber_delta=None       # None -> pure L2; else Huber for stability
+# ):
+#     T_max = smooth_max_time(temperatures, alpha=alpha, axis=0)     # (S,)
+#     # deficit is positive only if we failed to reach the threshold
+#     deficit = soft_relu((liquidus + margin) - T_max, beta=beta)  # (S,)
 
-    if active_mask is None:
-        mask = jnp.ones_like(T_max)
-    else:
-        mask = active_mask.astype(T_max.dtype)
+#     if active_mask is None:
+#         mask = jnp.ones_like(T_max)
+#     else:
+#         mask = active_mask.astype(T_max.dtype)
 
-    denom = jnp.clip(jnp.sum(mask), 1.0)
+#     denom = jnp.clip(jnp.sum(mask), 1.0)
 
-    if huber_delta is None:
-        per_item = deficit**2
-    else:
-        d = huber_delta
-        # Smooth near zero; linear for large misses
-        per_item = jnp.where(
-            deficit <= d,
-            0.5 * deficit**2,
-            d * (deficit - 0.5 * d),
-        )
+#     if huber_delta is None:
+#         per_item = deficit**2
+#     else:
+#         d = huber_delta
+#         # Smooth near zero; linear for large misses
+#         per_item = jnp.where(
+#             deficit <= d,
+#             0.5 * deficit**2,
+#             d * (deficit - 0.5 * d),
+#         )
 
-    loss = jnp.sum(mask * per_item) / denom
-    metrics = {"T_max_smooth": T_max, "melt_deficit": deficit, "melt_loss": loss}
-    return loss, metrics
+#     loss = jnp.sum(mask * per_item) / denom
+#     metrics = {"T_max_smooth": T_max, "melt_deficit": deficit, "melt_loss": loss}
+#     return loss, metrics
 
-# simulate_temperature_jit = jax.jit(simulate_temperature)
-# simulate_mechanics_jit  = jax.jit(simulate_mechanics)
+# def main_function(params):
+#     control_soft = 0.75 + 0.5 * jax.nn.sigmoid(params[:power_on_steps])
+#     control = jnp.concatenate((control_soft, jnp.zeros((steps - power_on_steps,))), axis=0)
 
-def main_function(params):
-    control_soft = 0.75 + 0.5 * jax.nn.sigmoid(params[:power_on_steps])
-    control = jnp.concatenate((control_soft, jnp.zeros((steps - power_on_steps,))), axis=0)
+#     # simulate_temperature_jit = jax.jit(simulate_temperature)
+#     # simulate_mechanics_jit  = jax.jit(simulate_mechanics)
+#     # temperatures = simulate_temperature_jit(control)
+#     # S_seq = simulate_mechanics_jit(temperatures)
+#     temperatures = simulate_temperature(control)
+#     S_seq = simulate_mechanics(temperatures)
 
-    # temperatures = simulate_temperature_jit(control)
-    # S_seq = simulate_mechanics_jit(temperatures)
+#     # Compute final von Mises stress
+#     S_final = S_seq[-1]  # shape: (n_e, n_q, 6)
+    
+#     # Von Mises stress (same as in save_vtk)
+#     von_mises = jnp.sqrt(0.5 * (
+#         (S_final[..., 0] - S_final[..., 1])**2 +
+#         (S_final[..., 1] - S_final[..., 2])**2 +
+#         (S_final[..., 2] - S_final[..., 0])**2 +
+#         6 * (S_final[..., 3]**2 + S_final[..., 4]**2 + S_final[..., 5]**2)
+#     ))
+#     stress_loss = jnp.mean(von_mises)
+    
+#     # Ensure all active nodes reached liquidus temperature at some point
+#     is_build = (nodes[:, 2] > 0.01).astype(jnp.float64)   # or z > 0 if that matches births
+#     melt_loss, _ = melt_loss_fn(temperatures, liquidus, active_mask=is_build, alpha=20.0, beta=20.0, margin=0, huber_delta=None)
+    
+#     # Final total loss
+#     loss = stress_loss #+ melt_loss
+    
+#     return loss, control
+
+# --- Loss + Training ---
+def main_function(params, smooth_weight=1e-2):
+    control = jnp.concatenate([
+        jnp.clip(params[:power_on_steps], 0.5, 2.0),
+        jnp.zeros((steps - power_on_steps,))
+    ], axis=0)
+    
+    smooth_penalty = smooth_weight * jnp.sum((params[1:] - params[:-1])**2)
     temperatures = simulate_temperature(control)
     S_seq = simulate_mechanics(temperatures)
 
@@ -321,13 +353,15 @@ def main_function(params):
     stress_loss = jnp.mean(von_mises)
     
     # Ensure all active nodes reached liquidus temperature at some point
-    is_build = (nodes[:, 2] > 0.01).astype(jnp.float64)   # or z > 0 if that matches births
-    melt_loss, _ = melt_loss_fn(temperatures, liquidus, active_mask=is_build, alpha=20.0, beta=20.0, margin=0, huber_delta=None)
+    T_max = jnp.max(temperatures, axis=0)  # shape: (n_nodes,)
+    T_deficit = jnp.clip(liquidus - T_max, a_min=0.0)
+    is_build = nodes[:, 2] > 0.0  # shape (n_nodes,)
+    melt_penalty = jnp.sum((T_deficit * is_build) ** 2) / jnp.sum(is_build)
     
     # Final total loss
-    loss = stress_loss #+ melt_loss
+    loss = stress_loss + 10.0 * melt_penalty + smooth_penalty
     
-    return loss, control
+    return loss , control
 
 def grad_check(params, eps=1e-3, n_checks=5):
     """
@@ -416,8 +450,6 @@ MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
 # Time and mesh
 steps = int(endTime / dt)
 power_on_steps = 500 # jnp.sum(jnp.array(state))
-power_off_steps = steps - power_on_steps
-print(f"Total time steps: {steps}, Power ON steps: {power_on_steps}, Power OFF steps: {power_off_steps}")
 n_n = len(nodes)
 n_e = len(elements)
 n_p = 8
@@ -445,6 +477,8 @@ bot_nodes = nodes[:, 2] < -2.9
 # Laser activation
 laser_loc = jnp.array(toolpath)
 laser_on = jnp.array(state)
+element_birth = jnp.array(element_birth)
+node_birth = jnp.array(node_birth)
 
 # Material models
 poisson = 0.3
@@ -457,7 +491,7 @@ T_Ref = ambient
 # Newton and CG tolerances
 tol = 1e-4
 cg_tol = 1e-4
-Maxit = 2
+Maxit = 1
 
 params_init = jnp.ones((power_on_steps,))
 
@@ -474,7 +508,7 @@ if __name__ == "__main__":
     if mode == "gradcheck":
         print("Running gradient check...")
         init_params = np.array(params_init) 
-        grad_check(init_params, eps=1e-6, n_checks=3)
+        grad_check(init_params, eps=1e-3, n_checks=2)
     elif mode == "optimize":
         print("Running optimization...")
         trained_params, loss_history, control_history = optimize(

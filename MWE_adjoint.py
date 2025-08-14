@@ -64,6 +64,160 @@ print("Number of elements: {}".format(len(elements)))
 print("Number of surfaces: {}".format(len(surfaces)))
 print("Number of time-steps: {}".format(len(toolpath)))
 
+# --- Implicit-Adjoint Newton Solve (custom VJP) --- #
+
+def _assemble_global(K_tangent, elem_dofs, n_dof, mask_e):
+    K_global = jnp.zeros((n_dof, n_dof))
+    def body(K, e_idx):
+        Ke = K_tangent[e_idx] * mask_e[e_idx]
+        dofs = elem_dofs[e_idx]
+        return K.at[dofs[:, None], dofs[None, :]].add(Ke), None
+    K_global, _ = jax.lax.scan(body, K_global, jnp.arange(K_tangent.shape[0]))
+    return K_global
+
+def _apply_dirichlet(K_global, R, Q_dof):
+    # Zero out constrained rows/cols; set unit diagonal
+    K_global = K_global * (Q_dof[:, None] * Q_dof[None, :])
+    K_global = K_global + jnp.diag(1.0 - Q_dof)
+    # Residual at fixed dofs is zero
+    R = R * Q_dof
+    return K_global, R
+
+def _compute_K_R(
+    U_it,
+    temperature_ip, E_th,
+    elements, nodes,
+    ele_K, ele_B, B_T, ele_D, ele_detJac,
+    shear, bulk, a, Y,
+    Ep_prev, Hard_prev,
+    mask_e, Q_dof, elem_dofs,
+    tikh=1e-6
+):
+    # Strain from displacements
+    E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
+    E_corr = (E_base - E_th) * mask_e[:, None, None]
+
+    # Constitutive: stress S and consistent tangent DS
+    S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+
+    # Element tangent assembly
+    D_diff    = (ele_detJac[:, :, None, None] * DS) - ele_D
+    B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)
+    K_tangent = ele_K + B_T_D_B  # ele_K must be available in closure
+
+    # K_tangent = jnp.sum(
+    #     B_T @ (ele_detJac[:, :, None, None] * DS) @ ele_B, axis=1
+    # ) * mask_e[:, None, None]
+
+    # Internal force vector (residual definition: R = F_int)
+    detS   = ele_detJac[..., None] * S
+    F_e    = jnp.einsum("eqik,eqk->ei", B_T, detS) * mask_e[:, None]
+    R_node = jnp.zeros((Q_dof.shape[0],))
+    R_node = R_node.at[elem_dofs.flatten()].add(F_e.flatten())
+
+    # Global K and residual with BCs + Tikhonov
+    K_global = _assemble_global(K_tangent, elem_dofs, Q_dof.shape[0], mask_e)
+    K_global = K_global + tikh * jnp.eye(K_global.shape[0])
+    K_global, R = _apply_dirichlet(K_global, R_node, Q_dof)
+    return K_global, R, E_corr, S
+
+# Register custom_vjp on the Newton "solve-to-equilibrium" mapping: (inputs) -> U*
+@jax.custom_vjp
+def newton_solve_implicit(
+    U_init, temperature_ip, E_th,
+    elements, nodes,
+    ele_K, ele_B, B_T, ele_D, ele_detJac,
+    shear, bulk, a, Y,
+    Ep_prev, Hard_prev,
+    mask_e, Q_dof, elem_dofs,
+    maxit=2
+):
+    # Primal Newton (any safe iteration; not differentiated)
+    def newton_iteration(i, U_it):
+        K, R, _, _ = _compute_K_R(
+            U_it, temperature_ip, E_th,
+            elements, nodes,
+            ele_K, ele_B, B_T, ele_D, ele_detJac,
+            shear, bulk, a, Y,
+            Ep_prev, Hard_prev,
+            mask_e, Q_dof, elem_dofs
+        )
+        dU = jnp.linalg.solve(K, -R).reshape(U_it.shape)
+        return U_it + dU
+
+    U_star = jax.lax.fori_loop(0, maxit, newton_iteration, U_init)
+
+    # Return U* as primal output; stash what we need for bwd
+    K_star, R_star, E_corr_star, S_star = _compute_K_R(
+        U_star, temperature_ip, E_th,
+        elements, nodes,
+        ele_K, ele_B, B_T, ele_D, ele_detJac,     
+        shear, bulk, a, Y,
+        Ep_prev, Hard_prev,
+        mask_e, Q_dof, elem_dofs
+    )
+
+    saved = (U_star, K_star, R_star, E_corr_star, S_star,
+             temperature_ip, E_th, elements, nodes,
+             ele_K, ele_B, B_T, ele_D, ele_detJac,
+             shear, bulk, a, Y,
+             Ep_prev, Hard_prev, mask_e, Q_dof, elem_dofs)
+    return U_star, saved
+
+def newton_solve_implicit_fwd(*args, **kwargs):
+    U_star, saved = newton_solve_implicit(*args, **kwargs)
+    return U_star, saved
+
+def newton_solve_implicit_bwd(saved, bar_Ustar):
+    (U_star, K_star, R_star, E_corr_star, S_star,
+    temperature_ip, E_th, elements, nodes,
+    ele_K, ele_B, B_T, ele_D, ele_detJac,
+    shear, bulk, a, Y,
+    Ep_prev, Hard_prev, mask_e, Q_dof, elem_dofs) = saved
+
+    # 1) Adjoint solve: K^T λ = bar_U*
+    bar_u = bar_Ustar.reshape(-1)
+    lam = jnp.linalg.solve(K_star.T, bar_u)
+
+    # 2) VJP of residual w.r.t. parameters at fixed U*
+    #    grads_theta = - lam^T (∂R/∂theta)
+    def R_of_inputs(temperature_ip_, E_th_, Ep_prev_, Hard_prev_):
+        K, R, _, _ = _compute_K_R(
+            U_star, K_star, R_star, E_corr_star, S_star,
+            temperature_ip, E_th, elements, nodes,
+            ele_K, ele_B, B_T, ele_D, ele_detJac,
+            shear, bulk, a, Y,
+            Ep_prev, Hard_prev, mask_e, Q_dof, elem_dofs
+            )
+        return R  # shape (ndof,)
+
+    vjp_inputs = jax.vjp(R_of_inputs, temperature_ip, E_th, Ep_prev, Hard_prev)[1]
+    g_temp_ip, g_Eth, g_Ep, g_Hard = vjp_inputs(lam)
+
+    # Gradients for arguments:
+    # U_init: solution of Newton does not depend on initial guess under implicit definition -> 0
+    g_U_init = jnp.zeros_like(U_star)
+
+    # Non-differentiated arrays (geometry, B-mats, materials except T/Ep/Hard): zeros
+    Z = lambda x: jax.tree_util.tree_map(jnp.zeros_like, x)
+
+    return (
+        g_U_init,            # U_init
+        -g_temp_ip,          # temperature_ip
+        -g_Eth,              # E_th
+        Z(elements),         # elements
+        Z(nodes),            # nodes
+        Z(ele_K), Z(ele_B), Z(B_T), Z(ele_D), Z(ele_detJac),
+        Z(shear), Z(bulk), Z(a), Z(Y),
+        -g_Ep,               # Ep_prev
+        -g_Hard,             # Hard_prev
+        Z(mask_e), Z(Q_dof), Z(elem_dofs),
+        None                 # maxit (static)
+    )
+
+# Tie fwd/bwd to the primitive
+newton_solve_implicit.defvjp(newton_solve_implicit_fwd, newton_solve_implicit_bwd)
+
 def mech(
     temperature,
     active_element_inds,
@@ -111,56 +265,27 @@ def mech(
     ele_B      = ele_B * mask_e[:, None, None, None]
     ele_D      = ele_D * mask_e[:, None, None, None]
     ele_detJac = ele_detJac * mask_e[:, None]
-
     B_T = jnp.transpose(ele_B, (0, 1, 3, 2))  # (n_e, 8, 24, 6)
     
     # Dirichlet BC mask at DOF level
     Q_node = jnp.where(nodes[:, 2] < -2.9, 0.0, 1.0) * mask_n   # (n_n,)
     Q_dof  = jnp.repeat(Q_node, 3)                              # (n_dof,)
-    
     elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e, 8))
 
-    def newton_iteration(i, U_it):
-        E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
-        E_corr = (E_base - E_th) * mask_e[:, None, None]
-        S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
-
-        D_diff    = (ele_detJac[:, :, None, None] * DS) - ele_D
-        B_T_D_B   = jnp.sum(B_T @ D_diff @ ele_B, axis=1)
-        K_tangent = ele_K + B_T_D_B
-
-        detS   = ele_detJac[..., None] * S
-        F_e    = jnp.einsum("eqik,eqk->ei", B_T, detS) * mask_e[:, None]
-        F_node = jnp.zeros((n_dof,))
-        F_node = F_node.at[elem_dofs.flatten()].add(F_e.flatten())
-        
-        def assemble_global(K_tangent, elem_dofs, n_dof, mask_e):
-            K_global = jnp.zeros((n_dof, n_dof))
-            def body(K, e_idx):
-                Ke = K_tangent[e_idx] * mask_e[e_idx]
-                dofs = elem_dofs[e_idx]
-                return K.at[dofs[:, None], dofs[None, :]].add(Ke), None
-            K_global, _ = jax.lax.scan(body, K_global, jnp.arange(K_tangent.shape[0]))
-            return K_global
-
-        def apply_dirichlet(K_global, resid, Q_dof):
-            # Mask out fixed DOFs by multiplying
-            K_global = K_global * (Q_dof[:, None] * Q_dof[None, :])
-            # Set diagonal to 1 for fixed DOFs
-            K_global = K_global + jnp.diag(1.0 - Q_dof)
-            # Mask out residuals
-            resid = resid * Q_dof
-            return K_global, resid
-
-        K_global = assemble_global(K_tangent, elem_dofs, n_dof, mask_e)
-        K_global = K_global + 1e-6 * jnp.eye(K_global.shape[0]) # Tikhonov
-        resid = -F_node
-        K_global, resid = apply_dirichlet(K_global, resid, Q_dof)
-        dU_flat = jnp.linalg.solve(K_global, resid)
-        dU_new = dU_flat.reshape((n_n, 3))
-        return U_it + dU_new
+    # --- NEW: implicit Newton with custom VJP ---
+    U_guess = U * mask_n[:, None]
+    U_it = newton_solve_implicit(
+        U_guess,                 # U_init
+        temperature_ip,          # (n_e, n_q)
+        E_th,                    # (n_e, n_q, 6)
+        elements, nodes,
+        ele_K, ele_B, B_T, ele_D, ele_detJac,
+        shear, bulk, a, Y,
+        Ep_prev, Hard_prev,
+        mask_e, Q_dof, elem_dofs,
+        maxit=Maxit
+    )
             
-    U_it = jax.lax.fori_loop(0, Maxit, newton_iteration, U * mask_n[:, None])
     dU = U_it - U
 
     # Final stress for output
