@@ -234,3 +234,31 @@ def surface_jacobian(nodes, surfaces, Bip_sur):
     Jac = jnp.matmul(Bip_sur, mapped_surf_nodes_pos[:,jnp.newaxis,:,:].repeat(4,axis=1))
     surf_detJac = jnp.linalg.det(Jac)
     return surf_detJac
+
+def load_data(data_dir='preprocessed_10x5', toolpath_name='10x5_toolpath.crs', dt=0.01):
+    elements = jnp.load(f'{data_dir}/elements.npy')
+    nodes = jnp.load(f'{data_dir}/nodes.npy')
+    surfaces = jnp.load(f'{data_dir}/surface.npy')
+    node_birth = jnp.load(f'{data_dir}/node_birth.npy')
+    element_birth = jnp.load(f'{data_dir}/element_birth.npy')
+    surface_birth = jnp.load(f'{data_dir}/surface_birth.npy')
+    surface_xy = jnp.load(f'{data_dir}/surface_xy.npy')
+    surface_flux = jnp.load(f'{data_dir}/surface_flux.npy')
+
+    toolpath, state, endTime = load_toolpath(filename=toolpath_name, dt = dt)
+    parCoords_element = jnp.array([[-1.0,-1.0,-1.0],[1.0,-1.0,-1.0],[1.0, 1.0,-1.0],[-1.0, 1.0,-1.0],
+                [-1.0,-1.0,1.0],[1.0,-1.0, 1.0], [ 1.0,1.0,1.0],[-1.0, 1.0,1.0]]) * 0.5773502692
+    parCoords_surface = jnp.array([[-1.0,-1.0],[-1.0, 1.0],[1.0,-1.0],[1.0,1.0]])* 0.5773502692
+
+    Nip_ele = jnp.stack([shape_fnc_element(pc) for pc in parCoords_element], axis=0)
+    Bip_ele = jnp.stack([derivate_shape_fnc_element(pc) for pc in parCoords_element], axis=0)
+    Nip_sur = jnp.stack([shape_fnc_surface(pc) for pc in parCoords_surface], axis=0)
+    Bip_sur = jnp.stack([derivate_shape_fnc_surface(pc) for pc in parCoords_surface], axis=0)
+    surf_detJacs = surface_jacobian(nodes, surfaces, Bip_sur)
+
+    print("Number of nodes: {}".format(len(nodes)))
+    print("Number of elements: {}".format(len(elements)))
+    print("Number of surfaces: {}".format(len(surfaces)))
+    print("Number of time-steps: {}".format(len(toolpath)))
+
+    return elements, nodes, surfaces, node_birth, element_birth, surface_birth, surface_xy, surface_flux, toolpath, state, endTime, Nip_ele, Bip_ele, Nip_sur, Bip_sur, surf_detJacs
