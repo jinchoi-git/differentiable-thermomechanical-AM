@@ -21,9 +21,9 @@ gpu_id = "0"
 if len(sys.argv) > 2:
     gpu_id = sys.argv[2]
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-# jax.config.update("jax_enable_x64", True)
+#jax.config.update("jax_enable_x64", True)
 
-work_dir = "./opt_316l_Stail_notempclip"
+work_dir = "./opt_ss316l_p50_lr1e-2_m0_nooh_Sat49_noclip"
 os.makedirs(work_dir, exist_ok=True)
 
 # --- Load data ---
@@ -289,7 +289,7 @@ def melt_loss_fn(
     metrics = {"T_max_smooth": T_max, "melt_deficit": deficit, "melt_loss": loss}
     return loss, metrics
 
-def overheat_loss_fn(temperatures, T_hi=2000.0, alpha=10.0):
+def overheat_loss_fn(temperatures, T_hi=2700.0, alpha=10.0):
     T_max = smooth_max_time(temperatures, alpha=alpha, axis=0)
     over = soft_relu(T_max - T_hi, beta=10.0)
     return jnp.mean(over**2)
@@ -300,6 +300,33 @@ def von_mises_from_S(S_frame):  # S_final: (..., 6)
     return jnp.sqrt(0.5 * ((s11 - s22)**2 + (s22 - s33)**2 + (s33 - s11)**2
                            + 6.0 * (s12**2 + s23**2 + s13**2)))
 
+# --- Blocked control parameterization ---
+N_BLOCKS = 50  # 50 params for 500 "laser on" steps (10 steps each)
+
+def expand_params_to_controls(params50, power_on_steps, power_off_steps, min_power=0.5, max_power=1.5):
+    """
+    params50: (50,) unconstrained trainable parameters (we'll clip at usage)
+    returns:
+      control_full: (steps,) per-step control for thermal (linear interpolation on 'on' window)
+      p_clip: (50,) block values AFTER clipping; these align with mech steps at t = 0,10,20,...,490
+    """
+    # Clip only at usage; keep the actual trainable params unconstrained
+    # p_clip = jnp.clip(params50, min_power, max_power)        # (50,)
+    p_clip = params50     # (50,)
+
+    # Make sure our blocks divide evenly (should be 10 if power_on_steps=500)
+    stride = power_on_steps // N_BLOCKS                       # expected 10
+    # Knot positions exactly on mechanics timesteps:
+    knots = jnp.arange(0, power_on_steps, stride, dtype=jnp.float32)   # [0,10,20,...,490] length 50
+    t = jnp.arange(power_on_steps, dtype=jnp.float32)                    # [0..power_on_steps-1]
+
+    # Linear interpolation for THERMAL so flux changes smoothly between knots
+    control_on_interp = jnp.interp(t, knots, p_clip)          # (power_on_steps,)
+
+    # Pad the "off" tail with zeros
+    control_full = jnp.concatenate([control_on_interp, jnp.zeros((power_off_steps,))], axis=0)
+    return control_full, p_clip
+
 simulate_temperature_jit = jax.jit(simulate_temperature)
 simulate_mechanics_jit  = jax.jit(simulate_mechanics)
 
@@ -307,9 +334,15 @@ def main_function(params, smooth_weight=1):
     # control_soft = 0.75 + 0.5 * jax.nn.sigmoid(params[:power_on_steps])
     # control = jnp.concatenate((control_soft, jnp.zeros((steps - power_on_steps,))), axis=0)
 
-    control_on = params[:power_on_steps]          # unconstrained
-    control_on = jnp.clip(control_on, 0.2, 2.0)   # apply only at usage
-    control = jnp.concatenate((control_on, jnp.zeros((steps - power_on_steps,))), axis=0)
+    # control_on = params[:power_on_steps]          # unconstrained
+    # control_on = jnp.clip(control_on, 0.5, 1.5)   # apply only at usage
+    # control = jnp.concatenate((control_on, jnp.zeros((steps - power_on_steps,))), axis=0)
+
+    # params shape: (N_BLOCKS,)  # 50
+    control, p_clip = expand_params_to_controls(
+        params, power_on_steps=power_on_steps, power_off_steps=power_off_steps,
+        min_power=0.5, max_power=1.5
+    )
 
     temperatures = simulate_temperature_jit(control)
     S_seq = simulate_mechanics_jit(temperatures)
@@ -317,22 +350,25 @@ def main_function(params, smooth_weight=1):
     # S_seq = simulate_mechanics(temperatures)
 
     # Compute final von Mises stress
-    K = 5
-    S_tail = S_seq[-K:]                    # (K, n_e, n_q, 6)
-    vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
+    # K = 5
+    # S_tail = S_seq[-K:]                    # (K, n_e, n_q, 6)
+    # vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
+    # stress_loss = jnp.mean(vm_tail**2)
+
+    # checks stress when on
+    S_on_tail = S_seq[49]                    # (n_e, n_q, 6)
+    vm_tail = jax.vmap(von_mises_from_S)(S_on_tail)  # (K, n_e, n_q)
     stress_loss = jnp.mean(vm_tail**2)
 
-    smooth_loss = smooth_weight * jnp.sum((params[1:] - params[:-1])**2)
-
-    # Ensure all active nodes reached liquidus temperature at some point
     melt_loss, _ = melt_loss_fn(temperatures, liquidus,
                                 active_mask=build_nodes, alpha=10.0, beta=10.0,
-                                margin=25.0, huber_delta=5.0)
-    oh_loss = 0.2 * overheat_loss_fn(temperatures, T_hi=2000.0, alpha=10.0)
-    loss = stress_loss + melt_loss + oh_loss + smooth_loss
+                                margin=0.0, huber_delta=None)
 
-    jax.debug.print("stress_loss: {}, melt_loss: {}, oh_loss: {}, smooth_loss: {}", stress_loss, melt_loss, oh_loss, smooth_loss)
-    jax.debug.print("total loss:  {}", loss)
+    # oh_loss = 0.2 * overheat_loss_fn(temperatures, T_hi=2673, alpha=10.0)
+    oh_loss = 0
+
+    loss = stress_loss + melt_loss + oh_loss 
+    jax.debug.print("stress_loss: {}, melt_loss: {}, oh_loss: {}, total loss: {}", stress_loss, melt_loss, oh_loss, loss)   
 
     return loss, control
 
@@ -448,13 +484,13 @@ n_e = len(elements)
 n_p = 8
 n_q = 8
 
-# Material & heat transfer properties (SS316L, constant at 300K)
+# # Material & heat transfer properties (SS316L, constant at 300K)
 ambient = 300.0
 dt = 0.01
 density = 0.008
 cp_val = 0.469
 cond_val = 0.0138
-Qin = 400.0 * 0.4 # absortivitiy
+Qin = 300.0 * 0.4 # absortivitiy
 base_power = Qin
 r_beam = 1.12
 h_conv = 0.00005
@@ -463,6 +499,22 @@ solidus = 1648
 liquidus = 1673
 latent = 260 / (liquidus - solidus)
 conds = jnp.ones((n_e, 8)) * cond_val
+
+# Material & heat transfer properties (Ti64, constant at 300K)
+# ambient = 300.0
+# dt = 0.01
+# density = 0.0044
+# cp_val = 0.546
+# cond_val = 0.00700
+# Qin = 250.0 * 0.4 # absortivitiy
+# base_power = Qin
+# r_beam = 1.12
+# h_conv = 0.00005
+# h_rad = 0.2
+# solidus = 1878
+# liquidus = 1928
+# latent = 286 / (liquidus - solidus)
+# conds = jnp.ones((n_e, 8)) * cond_val
 
 # Dirichlet boundary
 bot_nodes = nodes[:, 2] < -2.9
@@ -505,7 +557,8 @@ tol = 1e-4
 cg_tol = 1e-4
 Maxit = 3
 
-params_init = jnp.ones((power_on_steps,)) * 1.0
+# params_init = jnp.ones((power_on_steps,)) * 1.0
+params_init = jnp.ones((N_BLOCKS,)) * 1.0  # start at nominal power 1.0
 
 if __name__ == "__main__":   
     t_start = time.time()
@@ -520,13 +573,13 @@ if __name__ == "__main__":
     if mode == "gradcheck":
         print("Running gradient check...")
         init_params = np.array(params_init) 
-        grad_check(init_params, eps=1e-3, n_checks=10)
+        grad_check(init_params, eps=1e-3, n_checks=3)
 
     elif mode == "optimize":
         print("Running optimization...")
         trained_params, loss_history, control_history = optimize(
             params_init=params_init,
-            num_iterations=1000,
+            num_iterations=500,
             work_dir=work_dir,
             learning_rate=1e-2,
         )

@@ -18,7 +18,7 @@ def calc_cp(element, temperature, Nip_ele, solidus, liquidus, cp_val, latent):
     temperature_nodes = temperature[element]
     theta_ip = jnp.matmul(Nip_ele, temperature_nodes)
 
-    k = 0.5  # 1/K sharpness, tune
+    k = 1.0  # 1/K sharpness, tune
     s0 = jax.nn.sigmoid((theta_ip - solidus) * k)
     s1 = jax.nn.sigmoid((liquidus - theta_ip) * k)
     cp_el = cp_val + latent * (s0 * s1)

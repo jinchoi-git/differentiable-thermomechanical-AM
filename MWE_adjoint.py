@@ -651,7 +651,7 @@ if __name__ == "__main__":
     if mode == "gradcheck":
         print("Running gradient check...")
         init_params = np.array(params_init) 
-        grad_check(init_params, eps=1e-3, n_checks=5)
+        grad_check(init_params, eps=1e-3, n_checks=50)
 
     elif mode == "optimize":
         print("Running optimization...")
