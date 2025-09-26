@@ -1,0 +1,6 @@
+# Ignore optimization run dirs
+opt*/
+
+# Python cache
+__pycache__/
+*.pyc
