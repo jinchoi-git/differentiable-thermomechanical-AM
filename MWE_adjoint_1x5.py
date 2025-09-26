@@ -7,15 +7,12 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import optax
 from collections import namedtuple
-import pyvista as pv
-import vtk
-np.bool = np.bool_
 sys.path.append('./includes')
 from data_loader import load_data
 from thermal import update_birth, calc_cp, update_mvec_stiffness, update_fluxes
 from mech import elastic_stiff_matrix, constitutive_problem, compute_E
 from utils import save_vtk, find_latest
-from jax import lax
+import scipy.optimize as spo
 
 # --- Config ---
 gpu_id = "0"  
@@ -25,13 +22,15 @@ os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 # jax.config.update("jax_enable_x64", True)
 
 learning_rate = 1e-2
-work_dir = f"./opt_adjoint_ss316l_stresslossonlytrivial_Slaseroff_lr{learning_rate}"
+work_dir = f"./opt_adjoint_ti64_stresslossonlytrivial_lr{learning_rate}_squareloss_1x5_Sfinal_bfgs_2"
 os.makedirs(work_dir, exist_ok=True)
+
+BOT_HEIGHT = -0.9
 
 # --- Load data ---
 dt = 0.01
-data_dir = 'preprocessed_10x5'
-toolpath_name = '10x5_toolpath.crs'
+data_dir = 'preprocessed_1x5'
+toolpath_name = 'toolpath_1x5.crs'
 
 (
     elements, nodes, surfaces, node_birth, element_birth, surface_birth,
@@ -249,7 +248,7 @@ def mech(
     B_T = jnp.transpose(ele_B, (0, 1, 3, 2))  # (n_e, 8, 24, 6)
     
     # Dirichlet BC mask at DOF level
-    Q_node = jnp.where(nodes[:, 2] < -2.9, 0.0, 1.0) * mask_n   # (n_n,)
+    Q_node = jnp.where(nodes[:, 2] < BOT_HEIGHT, 0.0, 1.0) * mask_n   # (n_n,)
     Q_dof  = jnp.repeat(Q_node, 3)                              # (n_dof,)
     elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e, 8))
 
@@ -306,7 +305,7 @@ def simulate_temperature(control):
 
         update = dt * rhs / (m_vec + 1e-8) * an    
         temperature = temperature + update
-        temperature = temperature.at[bot_nodes].set(ambient)
+        temperature = temperature.at[BOT_NODES].set(ambient)
         temperatures = temperatures.at[t].set(temperature)
         return (temperature, temperatures), None
 
@@ -343,12 +342,12 @@ def simulate_mechanics(temperatures):
         dU=jnp.zeros((n_n, 3)),
     )
 
-    mech_on = jnp.arange(0, power_on_steps, 10)
-    mech_off = jnp.arange(power_on_steps, steps, 100)
-    mech_timesteps = jnp.concatenate([mech_on, mech_off], axis=0)
+    # mech_on = jnp.arange(0, power_on_steps, 10)
+    # mech_off = jnp.arange(power_on_steps, steps, 100)
+    # mech_timesteps = jnp.concatenate([mech_on, mech_off], axis=0)
     # jax.debug.print("Mechanical steps: {n}", n=mech_timesteps)
     
-    # mech_timesteps = jnp.arange(0, steps, 10)
+    mech_timesteps = jnp.arange(0, steps, 10)
     final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     
     return S_seq
@@ -385,123 +384,55 @@ def vm_from_S(Sf):
     vm2 = 0.5*((s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2 + 6.0*(s12**2+s23**2+s13**2))
     return jnp.sqrt(jnp.clip(vm2, 0.0, 1e16) + 1e-12)
 
-def tail_weighted_loss(temperatures, S_seq, power_on_steps, k_tail=12, decay=0.5):
-    mech_stride = 10                             # e.g., 10
-    on_end_mech = (power_on_steps - 1) // mech_stride    # last ON frame index
-
-    # start a little after shut-off to avoid the last heating spike if you want (Δ=0 or 1)
-    tail = S_seq[on_end_mech:]                                    # (T_tail, n_e, n_q, 6)
-
-    # pick k_tail frames (incl. final), exponentially weight toward the end
-    Ttail = tail.shape[0]
-    idx = jnp.linspace(0, Ttail-1, num=jnp.minimum(k_tail, Ttail))
-    idx = jnp.round(idx).astype(int)
-    sel = tail[idx]                                      # (k, n_e, n_q, 6)
-
-    t = jnp.arange(sel.shape[0])
-    w = decay ** (sel.shape[0]-1 - t)                    # heavier near the final
-    w = w / (jnp.sum(w) + 1e-12)
-
-    vm = jax.vmap(vm_from_S)(sel)                        # (k, n_e, n_q)
-    return jnp.sum(w[:,None,None] * (vm**2))
-
-# --- Blocked control parameterization ---
-N_BLOCKS = 50  # 50 params for 500 "laser on" steps (10 steps each)
-
-
-def expand_params_to_controls(params50, power_on_steps, power_off_steps):
+def expand_params_to_controls(params, power_on_steps, power_off_steps, min_power=0.5, max_power=1.5):
     """
-    Interpolate block params across the ON window, then pad OFF with zeros.
-    Returns:
-      control_full: (power_on_steps + power_off_steps,)
-      p_block:      (N_BLOCKS,) (just echo back the block params you passed in)
+    params50: (50,) unconstrained trainable parameters (we'll clip at usage)
+    returns:
+      control_full: (steps,) per-step control for thermal (linear interpolation on 'on' window)
+      p_clip: (50,) block values AFTER clipping; these align with mech steps at t = 0,10,20,...,490
     """
-    params50 = params50.astype(jnp.float32)
+    # Clip only at usage; keep the actual trainable params unconstrained
+    # p_clip = jnp.clip(params50, min_power, max_power)        # (50,)
+    p_clip = params ** 2    # (50,)
 
-    # times at which we want the per-step control (0,1,...,power_on_steps-1)
-    t = jnp.arange(power_on_steps, dtype=jnp.float32)
+    # Make sure our blocks divide evenly (should be 10 if power_on_steps=500)
+    stride = power_on_steps // N_BLOCKS                       # expected 10
+    # Knot positions exactly on mechanics timesteps:
+    knots = jnp.arange(0, power_on_steps, stride, dtype=jnp.float32)   # [0,10,20,...,490] length 50
+    t = jnp.arange(power_on_steps, dtype=jnp.float32)                    # [0..power_on_steps-1]
 
-    # Place knots exactly on 0,10,20,... when divisible; otherwise fall back to linspace
-    stride = power_on_steps // N_BLOCKS
-    if power_on_steps % N_BLOCKS == 0 and stride > 0:
-        knots = jnp.arange(0, power_on_steps, stride, dtype=jnp.float32)  # length == N_BLOCKS
-    else:
-        # ensures first=0 and last=power_on_steps-1 with exactly N_BLOCKS points
-        knots = jnp.linspace(0.0, power_on_steps - 1.0, N_BLOCKS, dtype=jnp.float32)
+    # Linear interpolation for THERMAL so flux changes smoothly between knots
+    control_on_interp = jnp.interp(t, knots, p_clip)          # (power_on_steps,)
 
-    # Linear interpolation across the ON window
-    control_on_interp = jnp.interp(t, knots, params50)  # (power_on_steps,)
-
-    # OFF tail = zeros
-    control_full = jnp.concatenate(
-        [control_on_interp, jnp.zeros((power_off_steps,), dtype=params50.dtype)], axis=0
-    )
-
-    return control_full, params50
-
-simulate_temperature_jit = jax.jit(simulate_temperature)
-simulate_mechanics_jit  = jax.jit(simulate_mechanics)
-
-def von_mises_from_S(S_frame):  # S_final: (..., 6)
-    s11, s22, s33, s12, s23, s13 = (S_frame[...,0], S_frame[...,1], S_frame[...,2],
-                                    S_frame[...,3], S_frame[...,4], S_frame[...,5])
-    return jnp.sqrt(0.5 * ((s11 - s22)**2 + (s22 - s33)**2 + (s33 - s11)**2
-                           + 6.0 * (s12**2 + s23**2 + s13**2)))
+    # Pad the "off" tail with zeros
+    control_full = jnp.concatenate([control_on_interp, jnp.zeros((power_off_steps,))], axis=0)
+    return control_full, p_clip
 
 # --------- main loss -----------
-def main_function(params, smooth_weight=1):
-    # control_soft = 0.75 + 0.5 * jax.nn.sigmoid(params[:power_on_steps])
-    # control = jnp.concatenate((control_soft, jnp.zeros((steps - power_on_steps,))), axis=0)
+def main_function(params):
+#     control = jnp.concatenate(
+#     [params**2,
+#      jnp.zeros((power_off_steps,), dtype=params.dtype)],
+#     axis=0,
+# )
+    control, _ = expand_params_to_controls(params, power_on_steps, power_off_steps)
 
-    # control_on = params[:power_on_steps]          # unconstrained
-    # control_on = jnp.clip(control_on, 0.5, 1.5)   # apply only at usage
-    # control = jnp.concatenate((control_on, jnp.zeros((steps - power_on_steps,))), axis=0)
+    T = simulate_temperature(control)       # (T_th, S)
+    S = simulate_mechanics(T)               # (T_m, n_e, n_q, 6)
 
-    # params shape: (N_BLOCKS,)  # 50
-    # control, p_clip = expand_params_to_controls(
-    #     params, power_on_steps=power_on_steps, power_off_steps=power_off_steps,
-    #     min_power=0.5, max_power=1.5
-    # )
+    Sf = S[-1]
+    s11,s22,s33,s12,s23,s13 = (Sf[...,0],Sf[...,1],Sf[...,2],Sf[...,3],Sf[...,4],Sf[...,5])
+    vm2 = 0.5 * ((s11 - s22)**2 + (s22 - s33)**2 + (s33 - s11)**2
+                 + 6.0 * (s12**2 + s23**2 + s13**2))
 
-    control = jnp.concatenate(
-    [jax.nn.sigmoid(params),
-     jnp.zeros((power_off_steps,), dtype=params.dtype)],
-    axis=0,
-)
+    # clip tiny for numerical safety
+    vm2 = jnp.clip(vm2, 0.0, 1e16)
+    stress_loss = jnp.mean(vm2)
 
-    temperatures = simulate_temperature_jit(control)
-    S_seq = simulate_mechanics_jit(temperatures)
-    # temperatures = simulate_temperature(control)
-    # S_seq = simulate_mechanics(temperatures)
+    # stress_loss = jnp.sum(Sf ** 2)
 
-    # Compute final von Mises stress
-    # K = 5
-    # S_tail = S_seq[-K:]                    # (K, n_e, n_q, 6)
-    # vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
-    # stress_loss = jnp.mean(vm_tail**2)
-
-    # checks stress when on
-    # S_on_tail = S_seq[-1]                    # (n_e, n_q, 6)
-    # vm_tail = jax.vmap(von_mises_from_S)(S_on_tail)  # (K, n_e, n_q)
-    # stress_loss = jnp.mean(vm_tail**2)
-
-    S_tail = S_seq[49]                    # (K, n_e, n_q, 6)
-    vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
-    stress_loss = jnp.mean(vm_tail)
-
-    # melt_loss, _ = melt_loss_fn(temperatures, liquidus,
-    #                             active_mask=build_nodes, alpha=10.0, beta=10.0,
-    #                             margin=0.0, huber_delta=None)
-    melt_loss = 0
-
-    # oh_loss = 0.2 * overheat_loss_fn(temperatures, T_hi=2673, alpha=10.0)
-    oh_loss = 0
-
-    loss = stress_loss + melt_loss + oh_loss 
-    jax.debug.print("stress_loss: {}, melt_loss: {}, oh_loss: {}, total loss: {}", stress_loss, melt_loss, oh_loss, loss)   
-
-    return loss, control
-
+    jax.debug.print("loss (mean VM^2): {meanv:.4e}, max VM^2: {maxv:.4e}", meanv=stress_loss, maxv=jnp.max(vm2))
+    return stress_loss, control
 
 def grad_check(params, eps=1e-3, n_checks=5):
     """
@@ -565,7 +496,7 @@ def optimize(params_init, num_iterations, work_dir, learning_rate=1e-3):
         loss_history.append(loss)
         control_history.append(control)
 
-        if iteration % 10 == 0:
+        if iteration % 1 == 0:
             # Save parameters
             np.save(os.path.join(work_dir, f"params_{iteration:04d}.npy"), np.array(params))
             np.save(os.path.join(work_dir, f"control_{iteration:04d}.npy"), np.array(control))
@@ -590,14 +521,14 @@ def optimize(params_init, num_iterations, work_dir, learning_rate=1e-3):
             plt.savefig(os.path.join(work_dir, f"control_plot_{iteration:04d}.png"))
             plt.close()
 
-    plt.figure(figsize=(8, 4))
-    plt.plot(np.array(loss_history), marker='o', linestyle='-')
-    plt.title(f'Loss history')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.tight_layout()
-    plt.savefig(os.path.join(work_dir, f"loss_history_plot_{iteration:04d}.png"))
-    plt.close()
+            plt.figure(figsize=(8, 4))
+            plt.plot(np.array(loss_history), marker='o', linestyle='-')
+            plt.title(f'Loss history')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.tight_layout()
+            plt.savefig(os.path.join(work_dir, f"loss_history_plot.png"))
+            plt.close()
 
     return params, loss_history, control_history
 
@@ -606,8 +537,8 @@ ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
 
 # Time and mesh
-steps = int(endTime / dt)
-power_on_steps = 500 # jnp.sum(jnp.array(state))
+steps = int(endTime / dt) + 1
+power_on_steps = 100 # jnp.sum(jnp.array(state))
 power_off_steps = steps - power_on_steps
 print(f"Total time steps: {steps}, Power ON steps: {power_on_steps}, Power OFF steps: {power_off_steps}")
 n_n = len(nodes)
@@ -616,38 +547,38 @@ n_p = 8
 n_q = 8
 
 # Material & heat transfer properties (SS316L, constant at 300K)
-ambient = 300.0
-dt = 0.01
-density = 0.008
-cp_val = 0.469
-cond_val = 0.0138
-Qin = 300.0 * 0.4 # absortivitiy
-base_power = Qin
-r_beam = 1.12
-h_conv = 0.00005
-h_rad = 0.2
-solidus = 1648
-liquidus = 1673
-latent = 260 / (liquidus - solidus)
-conds = jnp.ones((n_e, 8)) * cond_val
-
-# material properties (TI64)
 # ambient = 300.0
-# density = 0.0044
-# cp_val = 0.714 # at 1073
-# cond_val = 0.01780 # at 1073
-# Qin = 400.0 * 0.4
+# dt = 0.01
+# density = 0.008
+# cp_val = 0.469
+# cond_val = 0.0138
+# Qin = 300.0 * 0.4 # absortivitiy
 # base_power = Qin
 # r_beam = 1.12
 # h_conv = 0.00005
 # h_rad = 0.2
-# solidus = 1878
-# liquidus = 1928
-# latent = 286/(liquidus-solidus)
+# solidus = 1648
+# liquidus = 1673
+# latent = 260 / (liquidus - solidus)
 # conds = jnp.ones((n_e, 8)) * cond_val
 
+# material properties (TI64)
+ambient = 300.0
+density = 0.0044
+cp_val = 0.714 # at 1073
+cond_val = 0.01780 # at 1073
+Qin = 400.0 * 0.4
+base_power = Qin
+r_beam = 1.12
+h_conv = 0.00005
+h_rad = 0.2
+solidus = 1878
+liquidus = 1928
+latent = 286/(liquidus-solidus)
+conds = jnp.ones((n_e, 8)) * cond_val
+
 # Dirichlet boundary
-bot_nodes = nodes[:, 2] < -2.9
+BOT_NODES = nodes[:, 2] < BOT_HEIGHT
 build_nodes = (nodes[:, 2] > 0.1).astype(jnp.float32)   # (S,)
 N_nodes = jnp.maximum(jnp.sum(build_nodes), 1.0)
 
@@ -663,33 +594,378 @@ laser_on = jnp.array(state)
 # scl1 = 1.56361E-05
 
 # Material models ti64
-# poisson = 0.3
-# a1 = 10000
-# young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 1]) / 1e6
-# temp_young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 0])
-# Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
-# temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
-# scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
-# temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
-
-# Material models ss316L
 poisson = 0.3
 a1 = 10000
-young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 1]) / 1e6
-temp_young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 0])
-Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
-temp_Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 0])
-scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 1])
-temp_scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 0])
+young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 1]) / 1e6
+temp_young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 0])
+Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
+scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
+temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
+
+# Material models ss316L
+# poisson = 0.3
+# a1 = 10000
+# young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 1]) / 1e6
+# temp_young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 0])
+# Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+# temp_Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 0])
+# scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 1])
+# temp_scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 0])
 
 # Newton and CG tolerances
 tol = 1e-4
 cg_tol = 1e-4
 Maxit = 5
 
-params_init = jnp.ones((power_on_steps,))
-# params_init = jnp.ones((N_BLOCKS,))  # start at nominal power 1.0
-# params_init = jnp.zeros((N_BLOCKS,))  # start at nominal power 0
+# params = jnp.ones((power_on_steps,))
+N_BLOCKS = 10  # 50 params for 500 "laser on" steps (10 steps each)
+params = jnp.ones((N_BLOCKS,)) # start at nominal power 1.0
+# params = jnp.zeros((N_BLOCKS,))  # start at nominal power 0
+
+# def loss_only(p): return main_function(p)[0]
+
+# p = params_init
+# g = jax.grad(loss_only)(p)
+# jax.debug.print("||g||2={:.3e}  max|g|={:.3e}", jnp.linalg.norm(g), jnp.max(jnp.abs(g)))
+# jax.debug.print("g·p={:.3e}", jnp.vdot(g, p))   # should be >0 so stepping -g reduces amplitude
+
+# # finite-diff along +g should be positive
+# def fd_dir(p, d, eps=1e-3):
+#     d = d / (jnp.linalg.norm(d) + 1e-12)
+#     return (loss_only(p + eps*d) - loss_only(p - eps*d)) / (2*eps)
+# jax.debug.print("FD(+g)={:.3e}", fd_dir(p, g))
+
+# os.exit()
+
+def determinism_check(p):
+    L1 = loss_only(p)
+    L2 = loss_only(p)
+    jax.debug.print("replay ΔL = {d:.3e}", d=(L2 - L1))
+
+def _fp(x):
+    return (jnp.sum(x), jnp.sum(x * x))
+
+def loss_only(p):  # use your existing main_function
+    return main_function(p)[0]
+
+def audit_once(p):
+    # control, _ = expand_params_to_controls(p, power_on_steps, power_off_steps)
+
+    control = jnp.concatenate(
+    [jax.nn.sigmoid(params),
+     jnp.zeros((power_off_steps,), dtype=params.dtype)],
+    axis=0,
+)
+
+    T1 = simulate_temperature(control)
+    T2 = simulate_temperature(control)
+    jax.debug.print("ΔT sums: Δsum={:.3e}, Δsumsq={:.3e}",
+                    _fp(T2)[0]-_fp(T1)[0], _fp(T2)[1]-_fp(T1)[1])
+
+    # If T is stable, check mechanics on fixed T
+    S1 = simulate_mechanics(T1)
+    S2 = simulate_mechanics(T1)  # reuse same T!
+    vm2 = lambda Sf: 0.5*((Sf[...,0]-Sf[...,1])**2+(Sf[...,1]-Sf[...,2])**2+(Sf[...,2]-Sf[...,0])**2
+                          + 6*(Sf[...,3]**2+Sf[...,4]**2+Sf[...,5]**2))
+    jax.debug.print("ΔS sums: Δsum={:.3e}, Δsumsq={:.3e}",
+                    _fp(S2)[0]-_fp(S1)[0], _fp(S2)[1]-_fp(S1)[1])
+    jax.debug.print("ΔVM^2(final)={:.3e}",
+                    jnp.mean(vm2(S2[-1])) - jnp.mean(vm2(S1[-1])))
+
+# determinism_check(params)
+# audit_once(params)
+# os.exit()
+
+def _save_iter_artifacts(iteration, params_np, control_np, loss_history, work_dir,
+                         power_on_steps):
+    # Arrays
+    np.save(os.path.join(work_dir, f"params_{iteration:04d}.npy"), np.array(params_np))
+    np.save(os.path.join(work_dir, f"control_{iteration:04d}.npy"), np.array(control_np))
+    np.save(os.path.join(work_dir, f"loss_{iteration:04d}.npy"), np.array(loss_history))
+
+    # Plots
+    plt.figure(figsize=(8, 4))
+    plt.plot(np.array(params_np), marker='o', linestyle='-')
+    plt.title(f'Params at Iteration {iteration}')
+    plt.xlabel('Parameter Index'); plt.ylabel('Parameter Value')
+    plt.tight_layout()
+    plt.savefig(os.path.join(work_dir, f"params_plot_{iteration:04d}.png"))
+    plt.close()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(np.array(control_np)[:power_on_steps], marker='o', linestyle='-')
+    plt.title(f'Control at Iteration {iteration}')
+    plt.xlabel('Time Step'); plt.ylabel('Control Value')
+    plt.tight_layout()
+    plt.savefig(os.path.join(work_dir, f"control_plot_{iteration:04d}.png"))
+    plt.close()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(np.array(loss_history), marker='o', linestyle='-')
+    plt.title('Loss history')
+    plt.xlabel('Epoch'); plt.ylabel('Loss')
+    plt.tight_layout()
+    plt.savefig(os.path.join(work_dir, f"loss_history_plot_{iteration:04d}.png"))
+    plt.close()
+
+def optimize_bfgs(params_init, num_iterations, work_dir, learning_rate=None):
+    os.makedirs(work_dir, exist_ok=True)
+
+    params0 = np.asarray(params_init, dtype=np.float64)
+
+    def loss_only(p_jax):
+        return main_function(p_jax)[0]
+
+    loss_and_grad = jax.jit(jax.value_and_grad(loss_only))
+
+    loss_history = []
+    control_history = []
+
+    # --- initial snapshot (iteration 0) ---
+    p0_jax = jnp.asarray(params0, dtype=jnp.float32)
+    L0, control0 = main_function(p0_jax)  # use main_function to get control
+    loss_history.append(float(L0))
+    control_history.append(np.array(control0))
+    _save_iter_artifacts(
+        iteration=0,
+        params_np=np.array(p0_jax),
+        control_np=np.array(control0),
+        loss_history=loss_history,
+        work_dir=work_dir,
+        power_on_steps=power_on_steps,
+    )
+
+    # cache for callback
+    eval_cache = {"last_loss": float(L0), "last_control": np.array(control0), "iter": 1}
+
+    def fun_and_grad(x_np):
+        x_jax = jnp.asarray(x_np, dtype=jnp.float32)
+        val, grad = loss_and_grad(x_jax)
+        control, _ = expand_params_to_controls(x_jax, power_on_steps, power_off_steps)
+        eval_cache["last_loss"] = float(val)
+        eval_cache["last_control"] = np.asarray(control)
+        return float(val), np.asarray(grad, dtype=np.float64)
+
+    def cb(xk):
+        it = eval_cache["iter"]
+        loss_history.append(eval_cache["last_loss"])
+        control_history.append(eval_cache["last_control"])
+        _save_iter_artifacts(
+            iteration=it,
+            params_np=np.array(xk, dtype=np.float32),
+            control_np=eval_cache["last_control"],
+            loss_history=loss_history,
+            work_dir=work_dir,
+            power_on_steps=power_on_steps,
+        )
+        print(f"[LBFGS] iter {it:03d}  loss={loss_history[-1]:.6e}")
+        eval_cache["iter"] = it + 1
+
+    res = spo.minimize(
+        fun_and_grad, x0=params0, method="L-BFGS-B", jac=True,
+        options=dict(maxiter=int(num_iterations), gtol=1e-6, ftol=1e-10, maxcor=10, maxls=40),
+        callback=cb,
+    )
+
+    print(f"[LBFGS] status={res.status}  message={res.message}")
+    trained_params = res.x.astype(np.float32)
+
+    # (optional) save consolidated “latest” files
+    np.save(os.path.join(work_dir, "params_bfgs_latest.npy"), trained_params)
+    np.save(os.path.join(work_dir, "loss_bfgs_latest.npy"), np.array(loss_history))
+    
+    # After: trained_params, loss_history, control_history = optimize_bfgs(...)
+    # Build per-plot animations
+    make_animation_from_pattern(work_dir, "params_plot_*.png",         out_stem="params_anim",  fps=2)
+    make_animation_from_pattern(work_dir, "control_plot_*.png",        out_stem="control_anim", fps=2)
+    make_animation_from_pattern(work_dir, "loss_history_plot_*.png",   out_stem="loss_anim",    fps=2)
+
+    # Optional: single side-by-side dashboard per iteration (params | control | loss)
+    make_iteration_dashboard(work_dir, out_stem="dashboard_anim", fps=2)
+
+    return trained_params, np.array(loss_history), np.array(control_history, dtype=object)
+
+# --- Animations: stitch PNGs -> GIF / MP4 (H.264) ----------------------------
+import os, re, glob, warnings
+from typing import List, Optional, Tuple
+from PIL import Image
+import imageio.v3 as iio
+
+_num_re = re.compile(r"(\d+)")
+
+def _numeric_key(path: str):
+    """
+    Sorts ..._0000.png, ..._0001.png, ..._0010.png in numeric order.
+    """
+    # Prefer trailing number (e.g., params_plot_0012.png)
+    m = list(_num_re.finditer(os.path.basename(path)))
+    return int(m[-1].group(1)) if m else path
+
+def _collect_frames(work_dir: str, pattern: str) -> List[str]:
+    paths = glob.glob(os.path.join(work_dir, pattern))
+    paths.sort(key=_numeric_key)
+    return paths
+
+def _ensure_even_size(img: Image.Image) -> Image.Image:
+    """
+    H.264 encoders work best with even width/height. Pad by 1 px if needed.
+    """
+    w, h = img.size
+    pad_w = w % 2
+    pad_h = h % 2
+    if pad_w or pad_h:
+        new = Image.new(img.mode, (w + pad_w, h + pad_h), color="white")
+        new.paste(img, (0, 0))
+        return new
+    return img
+
+def _write_gif(frames: List[Image.Image], out_path: str, fps: int = 2, loop: int = 0):
+    if not frames:
+        return
+    # GIF uses duration per frame in ms
+    duration_ms = int(1000 / max(1, fps))
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        optimize=False,       # safer for many frames
+        duration=duration_ms,
+        loop=loop,
+        disposal=2,
+    )
+
+def _write_mp4(frames, out_path: str, fps: int = 2, quality: int = 8):
+    if not frames:
+        return
+    # PIL.Image -> uint8 ndarray
+    nd = [np.array(_ensure_even_size(im).convert("RGB")) for im in frames]
+    try:
+        # imageio-ffmpeg backend; libx264 is default for mp4
+        iio.imwrite(out_path, nd, fps=fps, codec="libx264", quality=8)
+    except Exception as e:
+        warnings.warn(f"MP4 export failed ({e}). Is ffmpeg available? Skipping MP4.")
+
+def make_animation_from_pattern(
+    work_dir: str,
+    pattern: str,
+    out_stem: str,
+    fps: int = 2,
+    resize_to: Optional[Tuple[int, int]] = None,
+    make_gif: bool = True,
+    make_mp4: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Convert a sequence of PNGs in work_dir matching `pattern` into GIF/MP4.
+    Returns (gif_path, mp4_path).
+    """
+    paths = _collect_frames(work_dir, pattern)
+    if not paths:
+        print(f"[animate] No frames found for pattern '{pattern}' in {work_dir}")
+        return (None, None)
+
+    frames: List[Image.Image] = []
+    for p in paths:
+        im = Image.open(p).convert("RGB")
+        if resize_to is not None:
+            im = im.resize(resize_to, Image.LANCZOS)
+        frames.append(im)
+
+    gif_path = os.path.join(work_dir, f"{out_stem}.gif") if make_gif else None
+    mp4_path = os.path.join(work_dir, f"{out_stem}.mp4") if make_mp4 else None
+
+    if make_gif and gif_path:
+        _write_gif(frames, gif_path, fps=fps, loop=0)
+        print(f"[animate] Wrote {gif_path}")
+
+    if make_mp4 and mp4_path:
+        _write_mp4(frames, mp4_path, fps=fps, quality=8)
+        if os.path.exists(mp4_path):
+            print(f"[animate] Wrote {mp4_path}")
+
+    # Close image file handles
+    for im in frames:
+        try:
+            im.close()
+        except:
+            pass
+
+    return (gif_path if make_gif else None, mp4_path if make_mp4 else None)
+
+def make_iteration_dashboard(
+    work_dir: str,
+    left_pattern="params_plot_*.png",
+    mid_pattern="control_plot_*.png",
+    right_pattern="loss_history_plot_*.png",
+    out_stem="dashboard",
+    fps=2,
+    width_per_panel=800,
+    pad=10,
+    make_gif=True,
+    make_mp4=True,
+):
+    """
+    Optional: for each iteration, horizontally concatenate params/control/loss plots
+    into a single 'dashboard' frame, then animate. Skips frames that are missing any panel.
+    """
+    lefts  = _collect_frames(work_dir, left_pattern)
+    mids   = _collect_frames(work_dir, mid_pattern)
+    rights = _collect_frames(work_dir, right_pattern)
+    if not (lefts and mids and rights):
+        print("[dashboard] Not all panels found; skipping dashboard animation.")
+        return (None, None)
+
+    # Build index maps by iteration number
+    def idx_map(paths):
+        return {_numeric_key(p): p for p in paths}
+    L = idx_map(lefts); M = idx_map(mids); R = idx_map(rights)
+    common_keys = sorted(set(L.keys()) & set(M.keys()) & set(R.keys()))
+    if not common_keys:
+        print("[dashboard] No common iterations across panels.")
+        return (None, None)
+
+    frames = []
+    target_h = None
+    for k in common_keys:
+        imgs = [Image.open(L[k]).convert("RGB"),
+                Image.open(M[k]).convert("RGB"),
+                Image.open(R[k]).convert("RGB")]
+        # Resize each to consistent height, then stack horizontally
+        if target_h is None:
+            target_h = max(im.height for im in imgs)
+        resized = [im.resize((int(im.width * (target_h / im.height)), target_h), Image.LANCZOS)
+                   for im in imgs]
+
+        total_w = sum(im.width for im in resized) + 2 * pad
+        canvas = Image.new("RGB", (total_w + 2*pad, target_h + 2*pad), "white")
+        x = pad
+        for im in resized:
+            canvas.paste(im, (x, pad))
+            x += im.width + pad
+        # Optionally, downscale to a fixed width per panel to keep file sizes reasonable
+        final_w = 3 * width_per_panel + 4 * pad
+        canvas = canvas.resize((final_w, int(canvas.height * (final_w / canvas.width))), Image.LANCZOS)
+        frames.append(canvas)
+
+    gif_path = os.path.join(work_dir, f"{out_stem}.gif") if make_gif else None
+    mp4_path = os.path.join(work_dir, f"{out_stem}.mp4") if make_mp4 else None
+
+    if make_gif and gif_path:
+        _write_gif(frames, gif_path, fps=fps, loop=0)
+        print(f"[dashboard] Wrote {gif_path}")
+    if make_mp4 and mp4_path:
+        _write_mp4(frames, mp4_path, fps=fps, quality=8)
+        if os.path.exists(mp4_path):
+            print(f"[dashboard] Wrote {mp4_path}")
+
+    for im in frames:
+        try:
+            im.close()
+        except:
+            pass
+
+    return (gif_path if make_gif else None, mp4_path if make_mp4 else None)
+# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":   
     t_start = time.time()
@@ -703,16 +979,24 @@ if __name__ == "__main__":
 
     if mode == "gradcheck":
         print("Running gradient check...")
-        init_params = np.array(params_init) 
+        init_params = np.array(params) 
         grad_check(init_params, eps=1e-3, n_checks=50)
 
     elif mode == "optimize":
         print("Running optimization...")
         trained_params, loss_history, control_history = optimize(
-            params_init=params_init,
-            num_iterations=500,
+            params_init=params,
+            num_iterations=100,
             work_dir=work_dir,
             learning_rate=learning_rate,
+        )
+
+    elif mode == "bfgs":
+        print("Running bfgs optimization...")
+        trained_params, loss_history, control_history = optimize_bfgs(
+            params_init=params,
+            num_iterations=100,
+            work_dir=work_dir,
         )
 
     elif mode == "forward":

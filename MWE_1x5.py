@@ -7,31 +7,30 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import optax
 from collections import namedtuple
-import pyvista as pv
-import vtk
-np.bool = np.bool_
 sys.path.append('./includes')
 from data_loader import load_data
 from thermal import update_birth, calc_cp, update_mvec_stiffness, update_fluxes
 from mech import elastic_stiff_matrix, constitutive_problem, compute_E
 from utils import save_vtk, find_latest
+from jaxopt import LBFGS
 
 # --- Config ---
 gpu_id = "0"  
 if len(sys.argv) > 2:
     gpu_id = sys.argv[2]
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-#jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 
 learning_rate = 1e-2
-work_dir = f"./opt_regular_ss316l_stresslossonlytrivial_Slaseroff_lr{learning_rate}"
+work_dir = f"./opt_regular_ti64_stresslossonlytrivial_lr{learning_rate}_squareloss_1x5_Sfinal_1"
 os.makedirs(work_dir, exist_ok=True)
+
+BOT_HEIGHT = -0.9
 
 # --- Load data ---
 dt = 0.01
-data_dir = 'preprocessed_10x5'
-toolpath_name = '10x5_toolpath_long.crs'
-
+data_dir = 'preprocessed_1x5'
+toolpath_name = 'toolpath_1x5.crs'
 (
     elements, nodes, surfaces, node_birth, element_birth, surface_birth,
     surface_xy, surface_flux, toolpath, state, endTime,
@@ -88,7 +87,7 @@ def mech(
     B_T = jnp.transpose(ele_B, (0, 1, 3, 2))  # (n_e, 8, 24, 6)
     
     # Dirichlet BC mask at DOF level
-    Q_node = jnp.where(nodes[:, 2] < -2.9, 0.0, 1.0) * mask_n   # (n_n,)
+    Q_node = jnp.where(nodes[:, 2] < BOT_HEIGHT, 0.0, 1.0) * mask_n   # (n_n,)
     Q_dof  = jnp.repeat(Q_node, 3)                              # (n_dof,)
     elem_dofs = jnp.repeat(elements * 3, 3, axis=1) + jnp.tile(jnp.arange(3), (n_e, 8))
 
@@ -172,7 +171,7 @@ def simulate_temperature(control):
 
         update = dt * rhs / (m_vec + 1e-8) * an    
         temperature = temperature + update
-        temperature = temperature.at[bot_nodes].set(ambient)
+        temperature = temperature.at[BOT_NODES].set(ambient)
         temperatures = temperatures.at[t].set(temperature)
         return (temperature, temperatures), None
 
@@ -209,12 +208,12 @@ def simulate_mechanics(temperatures):
         dU=jnp.zeros((n_n, 3)),
     )
 
-    mech_on = jnp.arange(0, power_on_steps, 10)
-    mech_off = jnp.arange(power_on_steps, steps, 100)
-    mech_timesteps = jnp.concatenate([mech_on, mech_off], axis=0)
+    # mech_on = jnp.arange(0, power_on_steps, 10)
+    # mech_off = jnp.arange(power_on_steps, steps, 100)
+    # mech_timesteps = jnp.concatenate([mech_on, mech_off], axis=0)
     # jax.debug.print("Mechanical steps: {n}", n=mech_timesteps)
     
-    # mech_timesteps = jnp.arange(0, steps, 10)
+    mech_timesteps = jnp.arange(0, steps, 10)   
     final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     
     return S_seq
@@ -240,8 +239,6 @@ def simulate_mechanics_forward(temperatures):
         Hard_prev=jnp.zeros((n_e, n_q, 6)),
         dU=jnp.zeros((n_n, 3)),
     )
-
-    mech_timesteps = jnp.arange(0, steps, 10)  # downsample factor = 10
     final_state, (S_seq, U_seq) = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq, U_seq
 
@@ -301,9 +298,8 @@ def von_mises_from_S(S_frame):  # S_final: (..., 6)
                            + 6.0 * (s12**2 + s23**2 + s13**2)))
 
 # --- Blocked control parameterization ---
-N_BLOCKS = 50  # 50 params for 500 "laser on" steps (10 steps each)
 
-def expand_params_to_controls(params50, power_on_steps, power_off_steps, min_power=0.5, max_power=1.5):
+def expand_params_to_controls(params, power_on_steps, power_off_steps, min_power=0.5, max_power=1.5):
     """
     params50: (50,) unconstrained trainable parameters (we'll clip at usage)
     returns:
@@ -312,7 +308,7 @@ def expand_params_to_controls(params50, power_on_steps, power_off_steps, min_pow
     """
     # Clip only at usage; keep the actual trainable params unconstrained
     # p_clip = jnp.clip(params50, min_power, max_power)        # (50,)
-    p_clip = params50     # (50,)
+    p_clip = params ** 2    # (50,)
 
     # Make sure our blocks divide evenly (should be 10 if power_on_steps=500)
     stride = power_on_steps // N_BLOCKS                       # expected 10
@@ -327,61 +323,33 @@ def expand_params_to_controls(params50, power_on_steps, power_off_steps, min_pow
     control_full = jnp.concatenate([control_on_interp, jnp.zeros((power_off_steps,))], axis=0)
     return control_full, p_clip
 
-simulate_temperature_jit = jax.jit(simulate_temperature)
-simulate_mechanics_jit  = jax.jit(simulate_mechanics)
+# --------- main loss -----------
+def main_function(params):
+#     control = jnp.concatenate(
+#     [params**2,
+#      jnp.zeros((power_off_steps,), dtype=params.dtype)],
+#     axis=0,
+# )
+    control, _ = expand_params_to_controls(params, power_on_steps, power_off_steps)
 
-def main_function(params, smooth_weight=1):
-    # control_soft = 0.75 + 0.5 * jax.nn.sigmoid(params[:power_on_steps])
-    # control = jnp.concatenate((control_soft, jnp.zeros((steps - power_on_steps,))), axis=0)
+    T = simulate_temperature(control)       # (T_th, S)
+    S = simulate_mechanics(T)               # (T_m, n_e, n_q, 6)
 
-    # control_on = params[:power_on_steps]          # unconstrained
-    # control_on = jnp.clip(control_on, 0.5, 1.5)   # apply only at usage
-    # control = jnp.concatenate((control_on, jnp.zeros((steps - power_on_steps,))), axis=0)
+    Sf = S[-1]
+    s11,s22,s33,s12,s23,s13 = (Sf[...,0],Sf[...,1],Sf[...,2],Sf[...,3],Sf[...,4],Sf[...,5])
+    vm2 = 0.5 * ((s11 - s22)**2 + (s22 - s33)**2 + (s33 - s11)**2
+                 + 6.0 * (s12**2 + s23**2 + s13**2))
+    
+    jax.debug.print("max VM^2: {v:.4e}", v=jnp.max(vm2))
 
-    # params shape: (N_BLOCKS,)  # 50
-    # control, p_clip = expand_params_to_controls(
-    #     params, power_on_steps=power_on_steps, power_off_steps=power_off_steps,
-    #     min_power=0.5, max_power=1.5
-    # )
+    # clip tiny for numerical safety
+    vm2 = jnp.clip(vm2, 0.0, 1e16)
+    stress_loss = jnp.mean(vm2)
 
-    control = jnp.concatenate(
-    [jax.nn.sigmoid(params),
-     jnp.zeros((power_off_steps,), dtype=params.dtype)],
-    axis=0,
-)
+    # stress_loss = jnp.sum(Sf ** 2)
 
-    temperatures = simulate_temperature_jit(control)
-    S_seq = simulate_mechanics_jit(temperatures)
-    # temperatures = simulate_temperature(control)
-    # S_seq = simulate_mechanics(temperatures)
-
-    # Compute final von Mises stress
-    # K = 5
-    # S_tail = S_seq[-K:]                    # (K, n_e, n_q, 6)
-    # vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
-    # stress_loss = jnp.mean(vm_tail**2)
-
-    # checks stress when on
-    # S_on_tail = S_seq[-1]                    # (n_e, n_q, 6)
-    # vm_tail = jax.vmap(von_mises_from_S)(S_on_tail)  # (K, n_e, n_q)
-    # stress_loss = jnp.mean(vm_tail**2)
-
-    S_tail = S_seq[49]                    # (K, n_e, n_q, 6)
-    vm_tail = jax.vmap(von_mises_from_S)(S_tail)  # (K, n_e, n_q)
-    stress_loss = jnp.mean(vm_tail)
-
-    # melt_loss, _ = melt_loss_fn(temperatures, liquidus,
-    #                             active_mask=build_nodes, alpha=10.0, beta=10.0,
-    #                             margin=0.0, huber_delta=None)
-    melt_loss = 0
-
-    # oh_loss = 0.2 * overheat_loss_fn(temperatures, T_hi=2673, alpha=10.0)
-    oh_loss = 0
-
-    loss = stress_loss + melt_loss + oh_loss 
-    jax.debug.print("stress_loss: {}, melt_loss: {}, oh_loss: {}, total loss: {}", stress_loss, melt_loss, oh_loss, loss)   
-
-    return loss, control
+    jax.debug.print("final VM^2: {v:.4e}", v=stress_loss)
+    return stress_loss, control
 
 def grad_check(params, eps=1e-3, n_checks=5):
     """
@@ -470,14 +438,14 @@ def optimize(params_init, num_iterations, work_dir, learning_rate=1e-3):
             plt.savefig(os.path.join(work_dir, f"control_plot_{iteration:04d}.png"))
             plt.close()
 
-    plt.figure(figsize=(8, 4))
-    plt.plot(np.array(loss_history), marker='o', linestyle='-')
-    plt.title(f'Loss history')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.tight_layout()
-    plt.savefig(os.path.join(work_dir, f"loss_history_plot_{iteration:04d}.png"))
-    plt.close()
+            plt.figure(figsize=(8, 4))
+            plt.plot(np.array(loss_history), marker='o', linestyle='-')
+            plt.title(f'Loss history')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.tight_layout()
+            plt.savefig(os.path.join(work_dir, f"loss_history_plot.png"))
+            plt.close()
 
     return params, loss_history, control_history
 
@@ -486,8 +454,8 @@ ThermalState = namedtuple("ThermalState", ["temperature", "temperatures"])
 MechState = namedtuple("MechState", ["U", "E", "Ep_prev", "Hard_prev", "dU"])
 
 # Time and mesh
-steps = int(endTime / dt)
-power_on_steps = 500 # jnp.sum(jnp.array(state))
+steps = int(endTime / dt) + 1
+power_on_steps = 100 # jnp.sum(jnp.array(state))
 power_off_steps = steps - power_on_steps
 print(f"Total time steps: {steps}, Power ON steps: {power_on_steps}, Power OFF steps: {power_off_steps}")
 n_n = len(nodes)
@@ -495,40 +463,39 @@ n_e = len(elements)
 n_p = 8
 n_q = 8
 
-# # Material & heat transfer properties (SS316L, constant at 300K)
-ambient = 300.0
-dt = 0.01
-density = 0.008
-cp_val = 0.469
-cond_val = 0.0138
-Qin = 300.0 * 0.4 # absortivitiy
-base_power = Qin
-r_beam = 1.12
-h_conv = 0.00005
-h_rad = 0.2
-solidus = 1648
-liquidus = 1673
-latent = 260 / (liquidus - solidus)
-conds = jnp.ones((n_e, 8)) * cond_val
-
-# Material & heat transfer properties (Ti64, constant at 300K)
+# Material & heat transfer properties (SS316L, constant at 300K)
 # ambient = 300.0
 # dt = 0.01
-# density = 0.0044
-# cp_val = 0.546
-# cond_val = 0.00700
-# Qin = 400.0 * 0.4 # absortivitiy
+# density = 0.008
+# cp_val = 0.469
+# cond_val = 0.0138
+# Qin = 300.0 * 0.4 # absortivitiy
 # base_power = Qin
 # r_beam = 1.12
 # h_conv = 0.00005
 # h_rad = 0.2
-# solidus = 1878
-# liquidus = 1928
-# latent = 286 / (liquidus - solidus)
+# solidus = 1648
+# liquidus = 1673
+# latent = 260 / (liquidus - solidus)
 # conds = jnp.ones((n_e, 8)) * cond_val
 
+# material properties (TI64)
+ambient = 300.0
+density = 0.0044
+cp_val = 0.714 # at 1073
+cond_val = 0.01780 # at 1073
+Qin = 400.0 * 0.4
+base_power = Qin
+r_beam = 1.12
+h_conv = 0.00005
+h_rad = 0.2
+solidus = 1878
+liquidus = 1928
+latent = 286/(liquidus-solidus)
+conds = jnp.ones((n_e, 8)) * cond_val
+
 # Dirichlet boundary
-bot_nodes = nodes[:, 2] < -2.9
+BOT_NODES = nodes[:, 2] < BOT_HEIGHT
 build_nodes = (nodes[:, 2] > 0.1).astype(jnp.float32)   # (S,)
 N_nodes = jnp.maximum(jnp.sum(build_nodes), 1.0)
 
@@ -544,33 +511,88 @@ laser_on = jnp.array(state)
 # scl1 = 1.56361E-05
 
 # Material models ti64
-# poisson = 0.3
-# a1 = 10000
-# young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 1]) / 1e6
-# temp_young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 0])
-# Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
-# temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
-# scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
-# temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
-
-# Material models ss316L
 poisson = 0.3
 a1 = 10000
-young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 1]) / 1e6
-temp_young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 0])
-Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
-temp_Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 0])
-scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 1])
-temp_scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 0])
+young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 1]) / 1e6
+temp_young1 = jnp.array(np.loadtxt('./materials/TI64_Young_Debroy.txt')[:, 0])
+Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+temp_Y1 = jnp.array(np.loadtxt('./materials/TI64_Yield_Debroy.txt')[:, 0])
+scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 1])
+temp_scl1 = jnp.array(np.loadtxt('./materials/TI64_Alpha_Debroy.txt')[:, 0])
+
+# Material models ss316L
+# poisson = 0.3
+# a1 = 10000
+# young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 1]) / 1e6
+# temp_young1 = jnp.array(np.loadtxt('./materials/SS316L_Young.txt')[:, 0])
+# Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 1]) / 1e6 * jnp.sqrt(2/3)
+# temp_Y1 = jnp.array(np.loadtxt('./materials/SS316L_Yield.txt')[:, 0])
+# scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 1])
+# temp_scl1 = jnp.array(np.loadtxt('./materials/SS316L_Alpha.txt')[:, 0])
 
 # Newton and CG tolerances
 tol = 1e-4
 cg_tol = 1e-4
 Maxit = 5
 
-params_init = jnp.ones((power_on_steps,))
-# params_init = jnp.ones((power_on_steps,)) * 1.0
-# params_init = jnp.ones((N_BLOCKS,)) * 1.0  # start at nominal power 1.0
+# params = jnp.ones((power_on_steps,))
+N_BLOCKS = 10  # 50 params for 500 "laser on" steps (10 steps each)
+params = jnp.ones((N_BLOCKS,)) # start at nominal power 1.0
+# params = jnp.zeros((N_BLOCKS,))  # start at nominal power 0
+
+# def loss_only(p): return main_function(p)[0]
+
+# p = params_init
+# g = jax.grad(loss_only)(p)
+# jax.debug.print("||g||2={:.3e}  max|g|={:.3e}", jnp.linalg.norm(g), jnp.max(jnp.abs(g)))
+# jax.debug.print("g·p={:.3e}", jnp.vdot(g, p))   # should be >0 so stepping -g reduces amplitude
+
+# # finite-diff along +g should be positive
+# def fd_dir(p, d, eps=1e-3):
+#     d = d / (jnp.linalg.norm(d) + 1e-12)
+#     return (loss_only(p + eps*d) - loss_only(p - eps*d)) / (2*eps)
+# jax.debug.print("FD(+g)={:.3e}", fd_dir(p, g))
+
+# os.exit()
+
+def determinism_check(p):
+    L1 = loss_only(p)
+    L2 = loss_only(p)
+    jax.debug.print("replay ΔL = {d:.3e}", d=(L2 - L1))
+
+def _fp(x):
+    return (jnp.sum(x), jnp.sum(x * x))
+
+def loss_only(p):  # use your existing main_function
+    return main_function(p)[0]
+
+def audit_once(p):
+    # control, _ = expand_params_to_controls(p, power_on_steps, power_off_steps)
+
+    control = jnp.concatenate(
+    [jax.nn.sigmoid(params),
+     jnp.zeros((power_off_steps,), dtype=params.dtype)],
+    axis=0,
+)
+
+    T1 = simulate_temperature(control)
+    T2 = simulate_temperature(control)
+    jax.debug.print("ΔT sums: Δsum={:.3e}, Δsumsq={:.3e}",
+                    _fp(T2)[0]-_fp(T1)[0], _fp(T2)[1]-_fp(T1)[1])
+
+    # If T is stable, check mechanics on fixed T
+    S1 = simulate_mechanics(T1)
+    S2 = simulate_mechanics(T1)  # reuse same T!
+    vm2 = lambda Sf: 0.5*((Sf[...,0]-Sf[...,1])**2+(Sf[...,1]-Sf[...,2])**2+(Sf[...,2]-Sf[...,0])**2
+                          + 6*(Sf[...,3]**2+Sf[...,4]**2+Sf[...,5]**2))
+    jax.debug.print("ΔS sums: Δsum={:.3e}, Δsumsq={:.3e}",
+                    _fp(S2)[0]-_fp(S1)[0], _fp(S2)[1]-_fp(S1)[1])
+    jax.debug.print("ΔVM^2(final)={:.3e}",
+                    jnp.mean(vm2(S2[-1])) - jnp.mean(vm2(S1[-1])))
+
+# determinism_check(params)
+# audit_once(params)
+# os.exit()
 
 if __name__ == "__main__":   
     t_start = time.time()
@@ -584,14 +606,23 @@ if __name__ == "__main__":
 
     if mode == "gradcheck":
         print("Running gradient check...")
-        init_params = np.array(params_init) 
-        grad_check(init_params, eps=1e-3, n_checks=3)
+        init_params = np.array(params) 
+        grad_check(init_params, eps=1e-3, n_checks=50)
 
     elif mode == "optimize":
         print("Running optimization...")
         trained_params, loss_history, control_history = optimize(
-            params_init=params_init,
-            num_iterations=500,
+            params_init=params,
+            num_iterations=100,
+            work_dir=work_dir,
+            learning_rate=learning_rate,
+        )
+
+    elif mode == "bfgs":
+        print("Running bfgs optimization...")
+        trained_params, loss_history, control_history = optimize(
+            params_init=params,
+            num_iterations=100,
             work_dir=work_dir,
             learning_rate=learning_rate,
         )
