@@ -492,7 +492,7 @@ def simulate_mechanics_forward(temperatures, mctx):
             state.dU, current_time, mctx
         )
         new_state = MechState(U, E, Ep_new, Hard_new, dU)
-        return new_state, S
+        return new_state, (S, U)
 
     initial_mech_state = MechState(
         U=jnp.zeros((n_n, 3)),
@@ -505,5 +505,5 @@ def simulate_mechanics_forward(temperatures, mctx):
     # your downsampled mechanics steps:
     mech_timesteps = jnp.arange(0, steps, 10)
 
-    final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
+    final_state, (S_seq, U_seq) = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq, U_seq

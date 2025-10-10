@@ -22,6 +22,7 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 import matplotlib.pyplot as plt
 import optax
 from collections import namedtuple
@@ -35,7 +36,7 @@ import scipy.optimize as spo
 jax.config.update("jax_enable_x64", False)
 
 learning_rate = 1e-2
-work_dir = f"./code_refactor"
+work_dir = f"./stress_melt_liq+500_time"
 run_dir = make_run_dir(work_dir, args.mode, tag=args.tag, timestamp=args.ts)
 print(f"[io] run_dir = {run_dir}")
 os.makedirs(run_dir, exist_ok=True)
@@ -98,6 +99,7 @@ stefan_boltz = 5.670374419e-8  # W·m⁻²·K⁻⁴ (keep units consistent with 
 # Dirichlet boundary
 BOT_NODES = nodes[:, 2] < BOT_HEIGHT
 build_nodes = (nodes[:, 2] > 0.1).astype(jnp.float32)   # (S,)
+
 N_nodes = jnp.maximum(jnp.sum(build_nodes), 1.0)
 
 # Laser activation
@@ -227,30 +229,54 @@ def expand_params_to_controls(params, power_on_steps, power_off_steps, min_power
     return control_full, p_clip
 
 # --------- main loss -----------
-def main_function(params):
-#     control = jnp.concatenate(
-#     [params**2,
-#      jnp.zeros((power_off_steps,), dtype=params.dtype)],
-#     axis=0,
-# )
-    control, _ = expand_params_to_controls(params, power_on_steps, power_off_steps)
+# weights you can tune
+STRESS_W = 1.0          # weight on stress loss
+MELT_W   = 100.0          # weight on melt loss
+SMOOTH_ALPHA = 30.0     # smooth-max sharpness; higher → closer to max
 
-    T = simulate_temperature(control, tctx)       # (T_th, S)
-    S = simulate_mechanics(T, mctx)               # (T_m, n_e, n_q, 6)
+def main_function(params):
+    control, _ = expand_params_to_controls(params, power_on_steps, power_off_steps)
+    # control = jnp.ones((power_on_steps,), dtype=jnp.float32) * 0.61145806
+    # control = jnp.concatenate([control, jnp.zeros((steps - control.shape[0],), control.dtype)], axis=0)
+
+    T = simulate_temperature(control, tctx)   # (steps, n_n)
+    S = simulate_mechanics(T, mctx)           # (T_m, n_e, n_q, 6)
 
     Sf = S[-1]
     s11,s22,s33,s12,s23,s13 = (Sf[...,0],Sf[...,1],Sf[...,2],Sf[...,3],Sf[...,4],Sf[...,5])
     vm2 = 0.5 * ((s11 - s22)**2 + (s22 - s33)**2 + (s33 - s11)**2
                  + 6.0 * (s12**2 + s23**2 + s13**2))
-
-    # clip tiny for numerical safety
-    vm2 = jnp.clip(vm2, 0.0, 1e16)
+    vm2 = jnp.clip(vm2, 0.0, jnp.inf)   # keep non-negative
     stress_loss = jnp.mean(vm2)
 
-    # stress_loss = jnp.sum(Sf ** 2)
+    # smooth max over time for each node: (n_n,)
+    #   softmax_max(T) = (1/alpha) * logsumexp(alpha*T)
+    Tmax_soft = logsumexp(SMOOTH_ALPHA * T, axis=0) / SMOOTH_ALPHA
 
-    jax.debug.print("loss (mean VM^2): {meanv:.4e}, max VM^2: {maxv:.4e}", meanv=stress_loss, maxv=jnp.max(vm2))
-    return stress_loss, control
+    # only penalize build nodes (exclude substrate)
+    # build_nodes is (n_n,) mask 0/1 that you already define in the runner
+    liquidus = tctx.liquidus
+    margin = 500 
+
+    # deficit below liquidus, clamped at 0 if the node reached melt at least once
+    deficit = jnp.maximum(liquidus + margin - Tmax_soft, 0.0)
+
+    # normalize by number of build nodes; small eps for safety in x64
+    denom = jnp.maximum(jnp.sum(build_nodes), 1.0)
+    melt_loss = jnp.sum(deficit * build_nodes) / denom
+
+    # Optionally normalize melt term by liquidus to keep scales similar:
+    # melt_loss = melt_loss / (liquidus + 1e-12)
+
+    # ------------------ Total loss ------------------
+    total_loss = STRESS_W * stress_loss + MELT_W * melt_loss
+
+    jax.debug.print(
+        "loss: total={tot:.4e} | stress={sl:.4e} | melt={ml:.4e} | melt_max_deficit={md:.3f}",
+        tot=total_loss, sl=stress_loss, ml=melt_loss, md=jnp.max(deficit)
+    )
+
+    return total_loss, control
 
 def grad_check(params, eps=1e-3, n_checks=5):
     """
@@ -444,7 +470,7 @@ if __name__ == "__main__":
         found_any = False
         for src in ["adam", "bfgs"]:
             try:
-                ctrl_path, src_run_dir = _latest_control_under(work_dir, src)
+                ctrl_path, src_run_dir = latest_control_under(work_dir, src)
             except FileNotFoundError as e:
                 print(f"[forward] Skip {src}: {e}")
                 continue
@@ -462,8 +488,7 @@ if __name__ == "__main__":
 
             # simulate
             temperatures = simulate_temperature(control, tctx)
-            bundle = simulate_mechanics_forward(temperatures, mctx, stride=1)
-            S_seq, U_seq = bundle.S, bundle.U
+            S_seq, U_seq = simulate_mechanics_forward(temperatures, mctx)
 
             # save next to the source run dir
             out_dir = os.path.join(src_run_dir, "forward")
@@ -471,20 +496,19 @@ if __name__ == "__main__":
             save_vtk(
                 temperatures, S_seq, U_seq,
                 elements, Bip_ele, nodes, element_birth, node_birth, dt,
-                work_dir=out_dir, keyword=f"{src}-forward"
+                run_dir=out_dir, keyword=f"{src}-forward"
             )
             print(f"[forward] Wrote VTKs to: {out_dir}")
 
         if not found_any:
-            print("[forward] No controls found under work_dir/adam or work_dir/bfgs.")
+            print("[forward] No controls found under run_dir/adam or run_dir/bfgs.")
 
     elif mode == "baseline":
         print("Running baseline simulation...")
-        control = jnp.ones((power_on_steps,), dtype=jnp.float32)
+        control = jnp.ones((power_on_steps,), dtype=jnp.float32) * 0.61145806
         control = jnp.concatenate([control, jnp.zeros((steps - control.shape[0],), control.dtype)], axis=0)
         temperatures = simulate_temperature(control, tctx)
-        bundle = simulate_mechanics_forward(temperatures, mctx, stride=1)
-        S_seq, U_seq = bundle.S, bundle.U
+        S_seq, U_seq = simulate_mechanics_forward(temperatures, mctx)
         save_vtk(temperatures, S_seq, U_seq, elements, Bip_ele, nodes, element_birth, node_birth, dt,
                  run_dir=run_dir, keyword="baseline")
 
