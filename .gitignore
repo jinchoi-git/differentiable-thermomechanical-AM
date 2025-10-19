@@ -1,5 +1,9 @@
 # Ignore optimization run dirs
 opt*/
+1*
+2*
+3*
+4*
 
 # Python cache
 __pycache__/

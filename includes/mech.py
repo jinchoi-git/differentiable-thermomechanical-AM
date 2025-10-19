@@ -465,7 +465,8 @@ def simulate_mechanics(temperatures, mctx):
     )
 
     # your downsampled mechanics steps:
-    mech_timesteps = jnp.arange(0, steps, 10)
+    stride = 10
+    mech_timesteps = jnp.arange(0, steps, stride)
 
     final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq
