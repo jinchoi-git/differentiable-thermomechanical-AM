@@ -2,7 +2,7 @@ import argparse, os, sys
 
 parser = argparse.ArgumentParser(description="Thermomech runner")
 parser.add_argument("mode", nargs="?", default="bfgs",
-                    choices=["gradcheck", "adam", "bfgs", "forward", "baseline", "bfgs_h", "bfgs_joint"],
+                    choices=["gradcheck", "adam", "bfgs", "forward", "baseline"],
                     help="Run mode")
 parser.add_argument("--iters", type=int, default=10,
                     help="Number of optimizer iterations (Adam/BFGS)")
@@ -36,10 +36,10 @@ from dataclasses import replace
 # --- Config ---
 jax.config.update("jax_enable_x64", False)
 
-# base_name = '1_stsl'
+base_name = '1_stsl'
 # base_name = '2_stml'
 # base_name = '3_mtsl'
-base_name = '4_mtml'
+# base_name = '4_mtml'
 learning_rate = 1e-2
 work_dir = f"./{base_name}_bfgsbound_10params_laserhcoopt_sbound1to1"
 run_dir = make_run_dir(work_dir, args.mode, tag=args.tag, timestamp=args.ts)
@@ -429,121 +429,6 @@ def optimize_bfgs(params_init, num_iterations, run_dir, learning_rate=None):
 
     return trained_params, np.array(loss_history), np.array(control_history, dtype=object)
 
-S_MIN, S_MAX = -1, 1       # s bounds (so h stays near baseline scale)
-
-def _unpack_joint_s(x):
-    return x[:-1], x[-1]   # [blocks..., s]
-
-def _loss_and_control_joint_s(x):
-    blocks, s = _unpack_joint_s(x)
-    control = expand_blocks_to_controls(blocks, power_on_steps, power_off_steps)
-
-    h_base = jnp.asarray(tctx.h_conv, dtype=jnp.float32)
-    h_eff  = h_base * jnp.asarray(s, dtype=jnp.float32)
-
-    local = replace(tctx, h_conv=h_eff)
-    T = simulate_temperature(control, local)
-    S = simulate_mechanics(T, mctx)
-
-    Sf = S[-1]
-    s11,s22,s33,s12,s23,s13 = (Sf[...,0],Sf[...,1],Sf[...,2],Sf[...,3],Sf[...,4],Sf[...,5])
-    vm2 = 0.5*((s11-s22)**2 + (s22-s33)**2 + (s33-s11)**2 + 6.0*(s12**2+s23**2+s13**2))
-    stress_loss = jnp.mean(jnp.clip(vm2, 0.0, jnp.inf))
-
-    Tmax_soft = jax.scipy.special.logsumexp(SMOOTH_ALPHA * T, axis=0) / SMOOTH_ALPHA
-    deficit = jnp.maximum(tctx.liquidus + 100.0 - Tmax_soft, 0.0)
-    melt_loss = jnp.sum(deficit * build_nodes) / jnp.maximum(jnp.sum(build_nodes), 1.0)
-
-    total = STRESS_W * stress_loss + MELT_W * melt_loss
-    jax.debug.print(
-        "loss: total={tot:.4e} | stress={sl:.4e} | melt={ml:.4e} ",
-        tot=total, sl=stress_loss, ml=melt_loss,
-    )
-
-    return total, control
-
-def optimize_bfgs_joint_s(
-    power_blocks_init,
-    s0,
-    num_iterations,
-    run_dir,
-    power_bounds=(CTRL_MIN, CTRL_MAX),
-    s_bounds=(S_MIN, S_MAX),
-):
-    os.makedirs(run_dir, exist_ok=True)
-
-    x0 = np.asarray(list(np.asarray(power_blocks_init, dtype=np.float32)) + [s0], dtype=np.float64)
-
-    def _loss_only(xvec):
-        L, _ctrl = _loss_and_control_joint_s(xvec)
-        return L
-
-    loss_and_grad = jax.jit(jax.value_and_grad(_loss_only))
-
-    loss_history, control_history = [], []
-
-    # --- iteration 0 snapshot ---
-    x0_jax = jnp.asarray(x0, dtype=jnp.float32)
-    L0, control0 = _loss_and_control_joint_s(x0_jax)
-    loss_history.append(float(L0))
-    control_history.append(np.array(control0))
-    save_iter_artifacts(
-        iteration=0,
-        params_np=np.array(x0_jax),
-        control_np=np.array(control0),
-        loss_history=loss_history,
-        run_dir=run_dir,
-        power_on_steps=power_on_steps,
-    )
-
-    cache = {"last_loss": float(L0), "last_control": np.array(control0), "iter": 1}
-
-    def fun_and_grad(x_np):
-        x_jax = jnp.asarray(x_np, dtype=jnp.float32)
-        val, grad = loss_and_grad(x_jax)
-        blocks, _s = _unpack_joint_s(x_jax)
-        control = expand_blocks_to_controls(blocks, power_on_steps, power_off_steps)
-        cache["last_loss"] = float(val)
-        cache["last_control"] = np.asarray(control)
-        return float(val), np.asarray(grad, dtype=np.float64)
-
-    bounds = [(power_bounds[0], power_bounds[1])] * int(N_BLOCKS) + [s_bounds]
-
-    def cb(xk):
-        it = cache["iter"]
-        loss_history.append(cache["last_loss"])
-        control_history.append(cache["last_control"])
-        save_iter_artifacts(
-            iteration=it,
-            params_np=np.array(xk, dtype=np.float32),
-            control_np=cache["last_control"],
-            loss_history=loss_history,
-            run_dir=run_dir,
-            power_on_steps=power_on_steps,
-        )
-        print(f"[LBFGS] iter {it:03d}  loss={loss_history[-1]:.6e}")
-        cache["iter"] = it + 1
-
-    res = spo.minimize(
-        fun_and_grad, x0=x0, method="L-BFGS-B", jac=True,
-        bounds=bounds,
-        options=dict(maxiter=int(num_iterations), gtol=1e-6, ftol=1e-10, maxcor=10, maxls=60),
-        callback=cb,
-    )
-
-    print(f"[LBFGS] status={res.status}  message={res.message}")
-    trained = res.x.astype(np.float32)      # [blocks..., s]
-    p_star, s_star = trained[:-1], float(trained[-1])
-
-    np.save(os.path.join(run_dir, "params_bfgs_latest.npy"), trained)
-    np.save(os.path.join(run_dir, "loss_bfgs_latest.npy"), np.array(loss_history))
-    make_animation_from_pattern(run_dir, "params_plot_*.png",       out_stem="params_anim",  fps=2)
-    make_animation_from_pattern(run_dir, "control_plot_*.png",      out_stem="control_anim", fps=2)
-    make_animation_from_pattern(run_dir, "loss_history_plot_*.png", out_stem="loss_anim",    fps=2)
-    make_iteration_dashboard(run_dir, out_stem="dashboard_anim", fps=2)
-
-    return p_star, s_star, np.array(loss_history), np.array(control_history, dtype=object)
-
 if __name__ == "__main__":
     t_start = time.time()
     mode = args.mode
@@ -622,26 +507,5 @@ if __name__ == "__main__":
         save_vtk(temperatures, S_seq, U_seq, elements, Bip_ele, nodes, element_birth, node_birth, dt,
                  run_dir=run_dir, keyword="baseline")
         
-    elif mode == "bfgs_h":
-        print("Optimizing h_conv only...")
-        h_star, loss_hist_h, control_hist_h = optimize_bfgs_h(
-            h0=5e-5,
-            num_iterations=num_iters,
-            run_dir=run_dir,
-            h_bounds=(5e-6, 5e-4),
-            control_blocks_fixed=jnp.ones((N_BLOCKS,), dtype=jnp.float32),
-        )
-
-    elif mode == "bfgs_joint":
-        print("Co-optimizing power blocks and h_conv...")
-        p_star, h_star, loss_hist_joint, control_hist_joint = optimize_bfgs_joint_s(
-        power_blocks_init=jnp.ones((N_BLOCKS,), dtype=jnp.float32),
-        s0=0.0,             
-        num_iterations=num_iters,
-        run_dir=run_dir,
-        power_bounds=(CTRL_MIN, CTRL_MAX),
-        s_bounds=(S_MIN, S_MAX),
-        )
-
     t_end = time.time()
     print(f"✅ Total Time: {t_end - t_start:.2f} seconds")
