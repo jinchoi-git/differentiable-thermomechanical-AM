@@ -1,3 +1,4 @@
+import os, json
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -99,7 +100,7 @@ def constitutive_problem(E, Ep_prev, Hard_prev, shear, bulk, a, Y, T_anneal=None
     )
     eps_norm = 1e-8
     norm_SD = jnp.sqrt(jnp.clip(sq, eps_norm, None))
-    #jax.debug.print("🔎 norm_SD = {ns}", ns=norm_SD)
+    #jax.debug.print("norm_SD = {ns}", ns=norm_SD)
     CRIT = norm_SD - Y
     IND_p = CRIT > 0.0    # Plastic indicator
     mask = IND_p.astype(jnp.float32)
@@ -190,7 +191,7 @@ def _newton_core(
         return K_global, R
 
     def _compute_K_R(U_it):
-        # strains, constitutive, etc…
+        # strains, constitutive, etc...
         E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
         E_corr = (E_base - E_th) * mask_e[:, None, None]
         S, DS, _, _, _ = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
@@ -433,7 +434,7 @@ def mech(
 
 # --- Mechanical simulation ---
 def simulate_mechanics(temperatures, mctx):
-    # ⬅️ pull sizes/time and schedules from context, not globals
+    # <- pull sizes/time and schedules from context, not globals
     n_n = mctx.n_n
     n_e = mctx.n_e
     n_q = mctx.n_q
@@ -471,8 +472,10 @@ def simulate_mechanics(temperatures, mctx):
     final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq
 
+
+
 def simulate_mechanics_forward(temperatures, mctx):
-    # ⬅️ pull sizes/time and schedules from context, not globals
+    # <- pull sizes/time and schedules from context, not globals
     n_n = mctx.n_n
     n_e = mctx.n_e
     n_q = mctx.n_q

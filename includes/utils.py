@@ -1,6 +1,7 @@
 # --- Visualization & Animation helpers ---------------------------------------
 from typing import List, Optional, Tuple
 import os, re, glob, warnings, datetime
+from pathlib import Path
 import numpy as np
 from PIL import Image
 import imageio.v3 as iio
@@ -14,7 +15,22 @@ from .mech import transformation
 
 _num_re = re.compile(r"(\d+)")
 
-def make_run_dir(base_dir: str, mode: str, tag: str | None = None, timestamp: bool = False) -> str:
+
+def get_project_root(marker: str = "preprocessed") -> Path:
+    """
+    Walk parents until we find the repo root (identified by the marker folder).
+    Falls back to the current file's parent if the marker is missing.
+    """
+    here = Path(__file__).resolve().parent
+    for parent in [here, *here.parents]:
+        if (parent / marker).exists():
+            return parent
+    return here
+
+
+def make_run_dir(
+    base_dir: str, mode: str, tag: str | None = None, timestamp: bool = False
+) -> str:
     """
     Create and return a subdirectory like:
       base_dir/mode/[YYYYmmdd-HHMMSS_][tag]
@@ -28,6 +44,7 @@ def make_run_dir(base_dir: str, mode: str, tag: str | None = None, timestamp: bo
     run_dir = os.path.join(*parts)
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
+
 
 def latest_control_under(work_root: str, mode: str) -> tuple[str, str]:
     """
@@ -44,7 +61,20 @@ def latest_control_under(work_root: str, mode: str) -> tuple[str, str]:
     run_dir = os.path.dirname(ctrl_path)
     return ctrl_path, run_dir
 
-def save_vtk(T_seq, S_seq, U_seq, elements, Bip_ele, nodes, element_birth, node_birth, dt, run_dir="./vtk_out", keyword="forward"):
+
+def save_vtk(
+    T_seq,
+    S_seq,
+    U_seq,
+    elements,
+    Bip_ele,
+    nodes,
+    element_birth,
+    node_birth,
+    dt,
+    run_dir="./vtk_out",
+    keyword="forward",
+):
     T_total = S_seq.shape[0]
 
     def get_detJacs(element):
@@ -52,79 +82,114 @@ def save_vtk(T_seq, S_seq, U_seq, elements, Bip_ele, nodes, element_birth, node_
         Jac = jnp.matmul(Bip_ele, nodes_pos)
         ele_detJac_ = jnp.linalg.det(Jac)
         return ele_detJac_
-    
+
     ele_detJac = jax.vmap(get_detJacs)(elements)
-    
+
     for t in range(0, T_total):
-        dt = 0.1 
+        dt = 0.1
         current_time = t * dt
         filename = os.path.join(run_dir, f"{keyword}_{t:04d}.vtk")
-        
+
         S = S_seq[t]
         U = U_seq[t]
-        T = T_seq[int(t*10)]   
-        
+        T = T_seq[int(t * 10)]
+
         # Recompute activation masks at this time
         active_element_inds = np.array(element_birth <= current_time)
         active_node_inds = np.array(node_birth <= current_time)
         n_e_save = int(np.sum(active_element_inds))
         n_n_save = int(np.sum(active_node_inds))
-        
+
         active_elements_list = elements[active_element_inds].tolist()
-        active_cells = np.array([item for sublist in active_elements_list for item in [8] + sublist])
+        active_cells = np.array(
+            [item for sublist in active_elements_list for item in [8] + sublist]
+        )
         active_cell_type = np.array([vtk.VTK_HEXAHEDRON] * len(active_elements_list))
-        
+
         points = np.array(nodes[0:n_n_save] + U[0:n_n_save])
         # points = np.array(nodes[0:n_n_save])
-        
-        Sv = transformation(np.sqrt(1/2 * ((S[0:n_e_save,:,0] - S[0:n_e_save,:,1])**2 + 
-                                        (S[0:n_e_save,:,1] - S[0:n_e_save,:,2])**2 + 
-                                        (S[0:n_e_save,:,2] - S[0:n_e_save,:,0])**2 + 
-                                        6 * (S[0:n_e_save,:,3]**2 + S[0:n_e_save,:,4]**2 + S[0:n_e_save,:,5]**2))), 
-                        elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S11 = transformation(S[0:n_e_save,:,0], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S22 = transformation(S[0:n_e_save,:,1], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S33 = transformation(S[0:n_e_save,:,2], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S12 = transformation(S[0:n_e_save,:,3], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S23 = transformation(S[0:n_e_save,:,4], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-        S13 = transformation(S[0:n_e_save,:,5], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save)
-    
+
+        Sv = transformation(
+            np.sqrt(
+                1
+                / 2
+                * (
+                    (S[0:n_e_save, :, 0] - S[0:n_e_save, :, 1]) ** 2
+                    + (S[0:n_e_save, :, 1] - S[0:n_e_save, :, 2]) ** 2
+                    + (S[0:n_e_save, :, 2] - S[0:n_e_save, :, 0]) ** 2
+                    + 6
+                    * (
+                        S[0:n_e_save, :, 3] ** 2
+                        + S[0:n_e_save, :, 4] ** 2
+                        + S[0:n_e_save, :, 5] ** 2
+                    )
+                )
+            ),
+            elements[0:n_e_save],
+            ele_detJac[0:n_e_save],
+            n_n_save,
+        )
+        S11 = transformation(
+            S[0:n_e_save, :, 0], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+        S22 = transformation(
+            S[0:n_e_save, :, 1], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+        S33 = transformation(
+            S[0:n_e_save, :, 2], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+        S12 = transformation(
+            S[0:n_e_save, :, 3], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+        S23 = transformation(
+            S[0:n_e_save, :, 4], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+        S13 = transformation(
+            S[0:n_e_save, :, 5], elements[0:n_e_save], ele_detJac[0:n_e_save], n_n_save
+        )
+
         # Using pyvista for vtk
         active_grid = pv.UnstructuredGrid(active_cells, active_cell_type, points)
         # active_grid.point_data['temp'] = np.clip(np.array(T[0:n_n_save]), 300, 2300)
-        active_grid.point_data['temp'] = np.array(T[0:n_n_save])
-        active_grid.point_data['S_von'] = np.array(Sv)
-        active_grid.point_data['S11'] = np.array(S11)
-        active_grid.point_data['S22'] = np.array(S22)
-        active_grid.point_data['S33'] = np.array(S33)
-        active_grid.point_data['S12'] = np.array(S12)
-        active_grid.point_data['S23'] = np.array(S23)
-        active_grid.point_data['S13'] = np.array(S13)
-        active_grid.point_data['U1'] = np.array(U[0:n_n_save, 0])
-        active_grid.point_data['U2'] = np.array(U[0:n_n_save, 1])
-        active_grid.point_data['U3'] = np.array(U[0:n_n_save, 2])
+        active_grid.point_data["temp"] = np.array(T[0:n_n_save])
+        active_grid.point_data["S_von"] = np.array(Sv)
+        active_grid.point_data["S11"] = np.array(S11)
+        active_grid.point_data["S22"] = np.array(S22)
+        active_grid.point_data["S33"] = np.array(S33)
+        active_grid.point_data["S12"] = np.array(S12)
+        active_grid.point_data["S23"] = np.array(S23)
+        active_grid.point_data["S13"] = np.array(S13)
+        active_grid.point_data["U1"] = np.array(U[0:n_n_save, 0])
+        active_grid.point_data["U2"] = np.array(U[0:n_n_save, 1])
+        active_grid.point_data["U3"] = np.array(U[0:n_n_save, 2])
         active_grid.save(filename)
 
+
 def find_latest(prefix, run_dir):
-    files = [f for f in os.listdir(run_dir) if f.startswith(prefix) and f.endswith('.npy')]
+    files = [
+        f for f in os.listdir(run_dir) if f.startswith(prefix) and f.endswith(".npy")
+    ]
     print(f"Found {len(files)} '{prefix}_*.npy' files")
     if not files:
         raise FileNotFoundError(f"No files with prefix '{prefix}' in {run_dir}")
-    iters = [int(f.split('_')[1].split('.')[0]) for f in files]
+    iters = [int(f.split("_")[1].split(".")[0]) for f in files]
     latest_iter = max(iters)
     latest_file = f"{prefix}_{latest_iter:04d}.npy"
-    print(f"→ Latest {prefix} file: {latest_file} (iter {latest_iter})")
+    print(f"[io] Latest {prefix} file: {latest_file} (iter {latest_iter})")
     return os.path.join(run_dir, latest_file), latest_iter
+
 
 def _numeric_key(path: str):
     """Sorts ..._0000.png, ..._0001.png, ..._0010.png in numeric order."""
     m = list(_num_re.finditer(os.path.basename(path)))
     return int(m[-1].group(1)) if m else path
 
+
 def _collect_frames(run_dir: str, pattern: str) -> List[str]:
     paths = glob.glob(os.path.join(run_dir, pattern))
     paths.sort(key=_numeric_key)
     return paths
+
 
 def _ensure_even_size(img: Image.Image) -> Image.Image:
     """Pad by 1 px if needed; some encoders prefer even width/height."""
@@ -137,6 +202,7 @@ def _ensure_even_size(img: Image.Image) -> Image.Image:
         return new
     return img
 
+
 def _write_gif(frames: List[Image.Image], out_path: str, fps: int = 2, loop: int = 0):
     if not frames:
         return
@@ -145,13 +211,16 @@ def _write_gif(frames: List[Image.Image], out_path: str, fps: int = 2, loop: int
         out_path,
         save_all=True,
         append_images=frames[1:],
-        optimize=False,     # safer for many frames
+        optimize=False,  # safer for many frames
         duration=duration_ms,
         loop=loop,
         disposal=2,
     )
 
-def _write_mp4(frames: List[Image.Image], out_path: str, fps: int = 2, quality: int = 8):
+
+def _write_mp4(
+    frames: List[Image.Image], out_path: str, fps: int = 2, quality: int = 8
+):
     if not frames:
         return
     nd = [np.array(_ensure_even_size(im).convert("RGB")) for im in frames]
@@ -159,6 +228,7 @@ def _write_mp4(frames: List[Image.Image], out_path: str, fps: int = 2, quality: 
         iio.imwrite(out_path, nd, fps=fps, codec="libx264", quality=quality)
     except Exception as e:
         warnings.warn(f"MP4 export failed ({e}). Is ffmpeg available?). Skipping MP4.")
+
 
 def make_animation_from_pattern(
     run_dir: str,
@@ -206,6 +276,7 @@ def make_animation_from_pattern(
 
     return (gif_path if make_gif else None, mp4_path if make_mp4 else None)
 
+
 def make_iteration_dashboard(
     run_dir: str,
     left_pattern="params_plot_*.png",
@@ -222,8 +293,8 @@ def make_iteration_dashboard(
     For each iteration, horizontally concatenate params/control/loss plots into
     a single 'dashboard' frame, then animate.
     """
-    lefts  = _collect_frames(run_dir, left_pattern)
-    mids   = _collect_frames(run_dir, mid_pattern)
+    lefts = _collect_frames(run_dir, left_pattern)
+    mids = _collect_frames(run_dir, mid_pattern)
     rights = _collect_frames(run_dir, right_pattern)
     if not (lefts and mids and rights):
         print("[dashboard] Not all panels found; skipping dashboard animation.")
@@ -243,9 +314,11 @@ def make_iteration_dashboard(
     frames = []
     target_h = None
     for k in common:
-        imgs = [Image.open(L[k]).convert("RGB"),
-                Image.open(M[k]).convert("RGB"),
-                Image.open(R[k]).convert("RGB")]
+        imgs = [
+            Image.open(L[k]).convert("RGB"),
+            Image.open(M[k]).convert("RGB"),
+            Image.open(R[k]).convert("RGB"),
+        ]
         if target_h is None:
             target_h = max(im.height for im in imgs)
         resized = [
@@ -283,7 +356,10 @@ def make_iteration_dashboard(
             pass
 
     return (gif_path if make_gif else None, mp4_path if make_mp4 else None)
+
+
 # -------------------------------------------------------------------------------
+
 
 def save_iter_artifacts(
     iteration: int,
@@ -301,13 +377,14 @@ def save_iter_artifacts(
     # Arrays
     np.save(os.path.join(run_dir, f"params_{iteration:04d}.npy"), np.array(params_np))
     np.save(os.path.join(run_dir, f"control_{iteration:04d}.npy"), np.array(control_np))
-    np.save(os.path.join(run_dir, f"loss_{iteration:04d}.npy"),    np.array(loss_history))
+    np.save(os.path.join(run_dir, f"loss_{iteration:04d}.npy"), np.array(loss_history))
 
     # Plots
     plt.figure(figsize=(8, 4))
     plt.plot(np.array(params_np), marker="o", linestyle="-")
     plt.title(f"Params at Iteration {iteration}")
-    plt.xlabel("Parameter Index"); plt.ylabel("Parameter Value")
+    plt.xlabel("Parameter Index")
+    plt.ylabel("Parameter Value")
     plt.tight_layout()
     plt.savefig(os.path.join(run_dir, f"params_plot_{iteration:04d}.png"))
     plt.close()
@@ -315,7 +392,8 @@ def save_iter_artifacts(
     plt.figure(figsize=(8, 4))
     plt.plot(np.array(control_np)[:power_on_steps], marker="o", linestyle="-")
     plt.title(f"Control at Iteration {iteration}")
-    plt.xlabel("Time Step"); plt.ylabel("Control Value")
+    plt.xlabel("Time Step")
+    plt.ylabel("Control Value")
     plt.tight_layout()
     plt.savefig(os.path.join(run_dir, f"control_plot_{iteration:04d}.png"))
     plt.close()
@@ -323,8 +401,11 @@ def save_iter_artifacts(
     plt.figure(figsize=(8, 4))
     plt.plot(np.array(loss_history), marker="o", linestyle="-")
     plt.title("Loss history")
-    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
     plt.tight_layout()
     plt.savefig(os.path.join(run_dir, f"loss_history_plot_{iteration:04d}.png"))
     plt.close()
+
+
 # -------------------------------------------------------------------------------

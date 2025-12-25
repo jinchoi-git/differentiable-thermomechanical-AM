@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import jax.numpy as jnp
+from pathlib import Path
 
 '''
 Load mesh information from .k file in LS-DYNA input format
@@ -148,7 +149,7 @@ def load_inputfile(filename='data/0.k'):
     return nodes, birth_list_node, elements, birth_list_element, element_surface, element_surface_birth
 
 def load_toolpath(filename = 'data/toolpath_c.crs', dt = 0.02):
-    toolpath_raw=pd.read_table(filename, delimiter=r"\s+",header=None, names=['time','x','y','z','state'])
+    toolpath_raw=pd.read_table(Path(filename), delimiter=r"\s+",header=None, names=['time','x','y','z','state'])
     toolpath=[]
     state=[]
     ctime=0.0
@@ -235,17 +236,36 @@ def surface_jacobian(nodes, surfaces, Bip_sur):
     surf_detJac = jnp.linalg.det(Jac)
     return surf_detJac
 
-def load_data(data_dir='preprocessed_10x5', toolpath_name='10x5_toolpath.crs', dt=0.01):
-    elements = jnp.load(f'{data_dir}/elements.npy')
-    nodes = jnp.load(f'{data_dir}/nodes.npy')
-    surfaces = jnp.load(f'{data_dir}/surface.npy')
-    node_birth = jnp.load(f'{data_dir}/node_birth.npy')
-    element_birth = jnp.load(f'{data_dir}/element_birth.npy')
-    surface_birth = jnp.load(f'{data_dir}/surface_birth.npy')
-    surface_xy = jnp.load(f'{data_dir}/surface_xy.npy')
-    surface_flux = jnp.load(f'{data_dir}/surface_flux.npy')
+def load_data(data_dir=None, toolpath_name=None, dt=0.01):
+    """
+    Load preprocessed mesh/BC arrays and toolpath information.
 
-    toolpath, state, endTime = load_toolpath(filename=toolpath_name, dt = dt)
+    data_dir and toolpath_name can be absolute paths or relative to the repo's
+    preprocessed/ folder.
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    default_data_root = project_root / "preprocessed"
+
+    data_dir = Path(data_dir) if data_dir is not None else default_data_root / "1_stsl_preprocessed"
+    if not data_dir.is_absolute():
+        candidate = default_data_root / data_dir
+        data_dir = candidate if candidate.exists() else data_dir
+
+    toolpath_path = Path(toolpath_name) if toolpath_name is not None else default_data_root / "1_stsl.crs"
+    if not toolpath_path.is_absolute():
+        candidate = default_data_root / toolpath_path
+        toolpath_path = candidate if candidate.exists() else toolpath_path
+
+    elements = jnp.load(data_dir / 'elements.npy')
+    nodes = jnp.load(data_dir / 'nodes.npy')
+    surfaces = jnp.load(data_dir / 'surface.npy')
+    node_birth = jnp.load(data_dir / 'node_birth.npy')
+    element_birth = jnp.load(data_dir / 'element_birth.npy')
+    surface_birth = jnp.load(data_dir / 'surface_birth.npy')
+    surface_xy = jnp.load(data_dir / 'surface_xy.npy')
+    surface_flux = jnp.load(data_dir / 'surface_flux.npy')
+
+    toolpath, state, endTime = load_toolpath(filename=toolpath_path, dt=dt)
     parCoords_element = jnp.array([[-1.0,-1.0,-1.0],[1.0,-1.0,-1.0],[1.0, 1.0,-1.0],[-1.0, 1.0,-1.0],
                 [-1.0,-1.0,1.0],[1.0,-1.0, 1.0], [ 1.0,1.0,1.0],[-1.0, 1.0,1.0]]) * 0.5773502692
     parCoords_surface = jnp.array([[-1.0,-1.0],[-1.0, 1.0],[1.0,-1.0],[1.0,1.0]])* 0.5773502692
