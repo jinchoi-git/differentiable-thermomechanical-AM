@@ -41,8 +41,11 @@ Python 3.12 is a hard requirement (not just a recommendation) — `includes/util
    | Case | `base_name` | `--n-blocks` | `--iters` |
    |---|---|---|---|
    | Single-track, single-layer | `1_stsl` | 10 | 60 |
+   | Single-track, multi-layer (3 layers) | `2_stml` | 30 | 60* |
    | Multi-track, single-layer (L-shape) | `3_mtsl` | 10 | 81 |
    | Multi-track, multi-layer (L-block) | `4_mtml` | 30 | 100 |
+
+   `--n-blocks` follows a ~10-knots-per-layer convention. \*`2_stml`'s `--iters` is a starting-point suggestion, not a validated/tuned value like the other three rows — check the loss curve (`bfgs_metrics.json` / the loss animation) and increase if it hasn't plateaued.
 
 4) `forward`/`baseline`/`baseline_avg` modes reuse the latest controls produced by `adam`/`bfgs` and dump VTK/PNG artifacts to the same run folder — **pass the same `--n-blocks` (and `base_name`) used for that run**, since the run folder's name encodes the param count and won't otherwise resolve to the right directory.
 
