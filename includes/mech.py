@@ -1,10 +1,11 @@
-import os, json
-import jax
-import jax.numpy as jnp
-import numpy as np
 from dataclasses import dataclass
 from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+
 from .thermal import update_birth
+
 
 class MechState(NamedTuple):
     U: jnp.ndarray
@@ -217,7 +218,7 @@ def _newton_core(
         return K_unreg, K_reg, R, E_corr, S
 
     def newton_iteration(i, U_it):
-        K_unreg, K_reg, R, _, _ = _compute_K_R(U_it)
+        _K_unreg, K_reg, R, _, _ = _compute_K_R(U_it)
         dU = jnp.linalg.solve(K_reg, -R).reshape(U_it.shape)
         return U_it + dU
 
@@ -275,11 +276,11 @@ def newton_solve_implicit_fwd(
     return U_star, saved
 
 def newton_solve_implicit_bwd(saved, bar_Ustar):
-    (U_star, K_unreg_star, K_reg_star, _R_star, _E_corr_star, _S_star,
+    (U_star, _K_unreg_star, K_reg_star, _R_star, _E_corr_star, _S_star,
      temperature_ip, E_th, elements, nodes,
      ele_K, ele_B, B_T, ele_D, ele_detJac,
      shear, bulk, a, Y,
-     Ep_prev, Hard_prev, mask_e, Q_dof, elem_dofs, tikh) = saved
+     Ep_prev, Hard_prev, mask_e, Q_dof, elem_dofs, _tikh) = saved
 
     # mask cotangent on Dirichlet dofs
     bar_u = bar_Ustar.reshape(-1) * Q_dof
@@ -360,7 +361,7 @@ def mech(
     # Masks
     mask_e = active_element_inds                # (n_e,)
     mask_n = active_node_inds                   # (n_n,)
-    n_dof = n_n * 3
+    n_n * 3
 
     # # Interpolate temperature at integration points
     temperature_ip = (
@@ -418,7 +419,7 @@ def mech(
     # Final stress for output
     E_base = jax.vmap(compute_E, in_axes=(0, 0, None))(elements, ele_B, U_it)
     E_corr = (E_base - E_th) * mask_e[:, None, None]
-    S_final, DS, IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
+    S_final, _DS, _IND_p, Ep_new, Hard_new = constitutive_problem(E_corr, Ep_prev, Hard_prev, shear, bulk, a, Y)
     
     # Update global U
     U = jax.lax.dynamic_update_slice(U, U_it, (0, 0))
@@ -469,7 +470,7 @@ def simulate_mechanics(temperatures, mctx):
     stride = 10
     mech_timesteps = jnp.arange(0, steps, stride)
 
-    final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
+    _final_state, S_seq = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq
 
 
@@ -509,5 +510,5 @@ def simulate_mechanics_forward(temperatures, mctx):
     # your downsampled mechanics steps:
     mech_timesteps = jnp.arange(0, steps, 10)
 
-    final_state, (S_seq, U_seq) = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
+    _final_state, (S_seq, U_seq) = jax.lax.scan(mech_scan_step, initial_mech_state, mech_timesteps)
     return S_seq, U_seq

@@ -1,6 +1,9 @@
 # Generated outputs
 results/
 
+# Archived experiments
+experimental/
+
 # Python cache
 __pycache__/
 *.pyc

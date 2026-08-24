@@ -1,5 +1,6 @@
-import argparse, os, sys, json
-from pathlib import Path
+import argparse
+import json
+import os
 
 parser = argparse.ArgumentParser(description="Thermomech runner")
 parser.add_argument(
@@ -24,32 +25,31 @@ args = parser.parse_args()
 # GPU must be set before importing jax
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 import time
-import numpy as np
+
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import logsumexp
 import matplotlib.pyplot as plt
+import numpy as np
 import optax
+import scipy.optimize as spo
+from jax.scipy.special import logsumexp
+
 from includes.data_loader import load_data
-from includes.thermal import ThermContext, simulate_temperature
 from includes.mech import (
     MechContext,
-    mech,
     simulate_mechanics,
     simulate_mechanics_forward,
 )
+from includes.thermal import ThermContext, simulate_temperature
 from includes.utils import (
-    save_vtk,
-    find_latest,
+    get_project_root,
+    latest_control_under,
     make_animation_from_pattern,
     make_iteration_dashboard,
-    save_iter_artifacts,
     make_run_dir,
-    latest_control_under,
-    get_project_root,
+    save_iter_artifacts,
+    save_vtk,
 )
-import scipy.optimize as spo
-from dataclasses import replace
 
 # --- Config ---
 jax.config.update("jax_enable_x64", True)
@@ -91,7 +91,8 @@ toolpath_name = DATA_ROOT / f"{base_name}.crs"
 ) = load_data(data_dir=data_dir, toolpath_name=toolpath_name, dt=dt)
 
 # Time and mesh
-power_on_time = float(open(toolpath_name).read().strip().splitlines()[-2].split()[0])
+with open(toolpath_name) as _toolpath_file:
+    power_on_time = float(_toolpath_file.read().strip().splitlines()[-2].split()[0])
 print(f"endTime from toolpath file: {endTime}")
 print(f"power_on_time from toolpath file: {power_on_time}")
 steps = int(endTime / dt) + 1
@@ -307,13 +308,13 @@ def melt_loss_from_temperatures(
 
 
 def save_loss_components_plot(iteration, total_hist, stress_hist, meltw_hist, run_dir):
-    import matplotlib.pyplot as plt, os
+    import os
 
     iters = range(len(total_hist))
     plt.figure(figsize=(6, 4), dpi=140)
     plt.plot(iters, total_hist, label="Total loss", linewidth=2)
     plt.plot(iters, stress_hist, label="Stress component", linewidth=1.75)
-    plt.plot(iters, meltw_hist, label=f"Melt component (weighted)", linewidth=1.75)
+    plt.plot(iters, meltw_hist, label="Melt component (weighted)", linewidth=1.75)
     plt.xlabel("Iteration")
     plt.ylabel("Loss")
     plt.title("Loss breakdown")
@@ -603,7 +604,7 @@ def optimize_bfgs(params_init, num_iterations, run_dir, learning_rate=None):
         loss_history.append(eval_cache["last_loss"])
         control_history.append(eval_cache["last_control"])
         # Compute components for this iterate xk
-        Lk, Sk, Mk, _ = compute_losses(jnp.asarray(xk, dtype=jnp.float32))
+        _Lk, Sk, Mk, _ = compute_losses(jnp.asarray(xk, dtype=jnp.float32))
         stress_history.append(float(Sk))
         meltw_history.append(float(Mk))
         save_iter_artifacts(
@@ -627,9 +628,9 @@ def optimize_bfgs(params_init, num_iterations, run_dir, learning_rate=None):
         method="L-BFGS-B",
         jac=True,
         bounds=bounds,
-        options=dict(
-            maxiter=int(num_iterations), gtol=1e-6, ftol=1e-10, maxcor=10, maxls=60
-        ),
+        options={
+            "maxiter": int(num_iterations), "gtol": 1e-6, "ftol": 1e-10, "maxcor": 10, "maxls": 60
+        },
         callback=cb,
     )
     print(f"[LBFGS] status={res.status}  message={res.message}")
