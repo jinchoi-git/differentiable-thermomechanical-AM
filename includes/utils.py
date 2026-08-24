@@ -1,16 +1,21 @@
 # --- Visualization & Animation helpers ---------------------------------------
-from typing import List, Optional, Tuple
-import os, re, glob, warnings, datetime
+import datetime
+import glob
+import os
+import re
+import warnings
+from collections.abc import Sequence
 from pathlib import Path
-import numpy as np
-from PIL import Image
+
 import imageio.v3 as iio
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
 import pyvista as pv
 import vtk
-import matplotlib.pyplot as plt
-from typing import Sequence
+from PIL import Image
+
 from .mech import transformation
 
 _num_re = re.compile(r"(\d+)")
@@ -38,7 +43,7 @@ def make_run_dir(
     """
     parts = [base_dir, mode]
     if timestamp:
-        parts.append(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        parts.append(datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S"))
     if tag:
         parts.append(tag)
     run_dir = os.path.join(*parts)
@@ -85,7 +90,7 @@ def save_vtk(
 
     ele_detJac = jax.vmap(get_detJacs)(elements)
 
-    for t in range(0, T_total):
+    for t in range(T_total):
         dt = 0.1
         current_time = t * dt
         filename = os.path.join(run_dir, f"{keyword}_{t:04d}.vtk")
@@ -185,7 +190,7 @@ def _numeric_key(path: str):
     return int(m[-1].group(1)) if m else path
 
 
-def _collect_frames(run_dir: str, pattern: str) -> List[str]:
+def _collect_frames(run_dir: str, pattern: str) -> list[str]:
     paths = glob.glob(os.path.join(run_dir, pattern))
     paths.sort(key=_numeric_key)
     return paths
@@ -203,7 +208,7 @@ def _ensure_even_size(img: Image.Image) -> Image.Image:
     return img
 
 
-def _write_gif(frames: List[Image.Image], out_path: str, fps: int = 2, loop: int = 0):
+def _write_gif(frames: list[Image.Image], out_path: str, fps: int = 2, loop: int = 0):
     if not frames:
         return
     duration_ms = int(1000 / max(1, fps))  # GIF uses per-frame duration in ms
@@ -219,14 +224,14 @@ def _write_gif(frames: List[Image.Image], out_path: str, fps: int = 2, loop: int
 
 
 def _write_mp4(
-    frames: List[Image.Image], out_path: str, fps: int = 2, quality: int = 8
+    frames: list[Image.Image], out_path: str, fps: int = 2, quality: int = 8
 ):
     if not frames:
         return
     nd = [np.array(_ensure_even_size(im).convert("RGB")) for im in frames]
     try:
         iio.imwrite(out_path, nd, fps=fps, codec="libx264", quality=quality)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - ffmpeg/codec failures vary widely; warn and continue
         warnings.warn(f"MP4 export failed ({e}). Is ffmpeg available?). Skipping MP4.")
 
 
@@ -235,10 +240,10 @@ def make_animation_from_pattern(
     pattern: str,
     out_stem: str,
     fps: int = 2,
-    resize_to: Optional[Tuple[int, int]] = None,
+    resize_to: tuple[int, int] | None = None,
     make_gif: bool = True,
     make_mp4: bool = True,
-) -> Tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """
     Convert a sequence of PNGs in run_dir matching `pattern` into GIF/MP4.
     Returns (gif_path, mp4_path).
@@ -248,7 +253,7 @@ def make_animation_from_pattern(
         print(f"[animate] No frames found for pattern '{pattern}' in {run_dir}")
         return (None, None)
 
-    frames: List[Image.Image] = []
+    frames: list[Image.Image] = []
     for p in paths:
         im = Image.open(p).convert("RGB")
         if resize_to is not None:
@@ -271,7 +276,7 @@ def make_animation_from_pattern(
     for im in frames:
         try:
             im.close()
-        except:
+        except Exception:  # noqa: S110, BLE001 - best-effort cleanup
             pass
 
     return (gif_path if make_gif else None, mp4_path if make_mp4 else None)
@@ -352,7 +357,7 @@ def make_iteration_dashboard(
     for im in frames:
         try:
             im.close()
-        except:
+        except Exception:  # noqa: S110, BLE001 - best-effort cleanup
             pass
 
     return (gif_path if make_gif else None, mp4_path if make_mp4 else None)

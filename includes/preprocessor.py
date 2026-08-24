@@ -1,14 +1,10 @@
-from numba import jit, vectorize, guvectorize, cuda
+import time
+
+import cupy as cp
 import numpy as np
 import pandas as pd
-import pyvista as pv
-from pyvirtualdisplay import Display
-import vtk
-import cupy as cp
 from cupyx import scatter_add
-import time
-import matplotlib.pyplot as plt
-import os
+from numba import jit
 
 
 def write_keywords(file_name, output_file, height):
@@ -16,7 +12,7 @@ def write_keywords(file_name, output_file, height):
         lines = input_file.readlines()
 
         # find the start line of node
-        for num in range(0, len(lines)):
+        for num in range(len(lines)):
             if "*Node" in lines[num]:
                 break
         node_num = num + 1
@@ -49,7 +45,7 @@ def write_keywords(file_name, output_file, height):
 
     # part ID, if any of the node is higher than the substrate then define as 1
     part_id = 2 * np.ones([len(element), 1])
-    for e in range(0, len(element)):
+    for e in range(len(element)):
         for id in element[e][1:9]:
             if node[int(id - 1)][3] > height:
                 part_id[e] = 1
@@ -71,103 +67,102 @@ def write_keywords(file_name, output_file, height):
             node_set3.append(int(node[i, 0]))
     node_set3 = np.asarray(node_set3)
 
-    f = open(output_file, "w")
-    # write node information
-    f.write("*NODE\n")
-    f.write(
-        "$#   nid               x               y               z      tc      rc\n"
-    )
-    for n in node:
-        f.write("%8d" % n[0])
-        f.write("%16f" % n[1])
-        f.write("%16f" % n[2])
-        f.write("%16f" % (n[3] - height))
-        f.write("       0       0\n")
+    with open(output_file, "w") as f:
+        # write node information
+        f.write("*NODE\n")
+        f.write(
+            "$#   nid               x               y               z      tc      rc\n"
+        )
+        for n in node:
+            f.write(f"{n[0]:8.0f}")
+            f.write(f"{n[1]:16f}")
+            f.write(f"{n[2]:16f}")
+            f.write(f"{n[3] - height:16f}")
+            f.write("       0       0\n")
 
-    # write element information
-    f.write("*ELEMENT_SOLID\n")
-    f.write(
-        "$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8\n"
-    )
-    for e, p in zip(element, part_id):
-        f.write("%8d" % e[0])
-        f.write("%8d" % p)
-        for i in range(1, 9):
-            f.write("%8d" % e[i])
+        # write element information
+        f.write("*ELEMENT_SOLID\n")
+        f.write(
+            "$#   eid     pid      n1      n2      n3      n4      n5      n6      n7      n8\n"
+        )
+        for e, p in zip(element, part_id):
+            f.write(f"{e[0]:8.0f}")
+            f.write(f"{p:8.0f}")
+            for i in range(1, 9):
+                f.write(f"{e[i]:8.0f}")
+            f.write("\n")
+
+        # write node set1
+        f.write("*SET_NODE_LIST\n")
+        f.write("$#     sid       da1       da2       da3       da4    solver\n")
+        f.write("         1\n")
+        f.write(
+            "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
+        )
+        for i in range(len(node_set1)):
+            f.write(f"{node_set1[i]:10.0f}")
+            if (i + 1) % 8 == 0:
+                f.write("\n")
         f.write("\n")
 
-    # write node set1
-    f.write("*SET_NODE_LIST\n")
-    f.write("$#     sid       da1       da2       da3       da4    solver\n")
-    f.write("         1\n")
-    f.write(
-        "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
-    )
-    for i in range(0, len(node_set1)):
-        f.write("%10d" % node_set1[i])
-        if (i + 1) % 8 == 0:
-            f.write("\n")
-    f.write("\n")
-
-    # write node set2
-    f.write("*SET_NODE_LIST\n")
-    f.write("$#     sid       da1       da2       da3       da4    solver\n")
-    f.write("         2\n")
-    f.write(
-        "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
-    )
-    for i in range(0, len(node_set2)):
-        f.write("%10d" % node_set2[i])
-        if (i + 1) % 8 == 0:
-            f.write("\n")
-    f.write("\n")
-
-    # write node set3
-    f.write("*SET_NODE_LIST\n")
-    f.write("$#     sid       da1       da2       da3       da4    solver\n")
-    f.write("         3\n")
-    f.write(
-        "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
-    )
-    for i in range(0, len(node_set3)):
-        f.write("%10d" % node_set3[i])
-        if (i + 1) % 8 == 0:
-            f.write("\n")
-    f.write("\n")
-
-    # write solid set1
-    f.write("*SET_SOLID\n")
-    f.write("$#     sid    solver\n")
-    f.write("         1MECH\n")
-    f.write(
-        "$#      k1        k2        k3        k4        k5        k6        k7        k8\n"
-    )
-    e_num = 0
-    for i in range(0, len(part_id)):
-        if part_id[i] == 1:
-            f.write("%10d" % (i + 1))
-            e_num = e_num + 1
-            if (e_num) % 8 == 0:
+        # write node set2
+        f.write("*SET_NODE_LIST\n")
+        f.write("$#     sid       da1       da2       da3       da4    solver\n")
+        f.write("         2\n")
+        f.write(
+            "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
+        )
+        for i in range(len(node_set2)):
+            f.write(f"{node_set2[i]:10.0f}")
+            if (i + 1) % 8 == 0:
                 f.write("\n")
-    f.write("\n")
+        f.write("\n")
 
-    # write solid set2
-    f.write("*SET_SOLID\n")
-    f.write("$#     sid    solver\n")
-    f.write("         2MECH\n")
-    f.write(
-        "$#      k1        k2        k3        k4        k5        k6        k7        k8\n"
-    )
-    e_num = 0
-    for i in range(0, len(part_id)):
-        if part_id[i] == 2:
-            f.write("%10d" % (i + 1))
-            e_num = e_num + 1
-            if (e_num) % 8 == 0:
+        # write node set3
+        f.write("*SET_NODE_LIST\n")
+        f.write("$#     sid       da1       da2       da3       da4    solver\n")
+        f.write("         3\n")
+        f.write(
+            "$#    nid1      nid2      nid3      nid4      nid5      nid6      nid7      nid8\n"
+        )
+        for i in range(len(node_set3)):
+            f.write(f"{node_set3[i]:10.0f}")
+            if (i + 1) % 8 == 0:
                 f.write("\n")
-    f.write("\n")
-    f.write("*END")
-    f.close()
+        f.write("\n")
+
+        # write solid set1
+        f.write("*SET_SOLID\n")
+        f.write("$#     sid    solver\n")
+        f.write("         1MECH\n")
+        f.write(
+            "$#      k1        k2        k3        k4        k5        k6        k7        k8\n"
+        )
+        e_num = 0
+        for i in range(len(part_id)):
+            if part_id[i] == 1:
+                f.write(f"{i + 1:10d}")
+                e_num = e_num + 1
+                if (e_num) % 8 == 0:
+                    f.write("\n")
+        f.write("\n")
+
+        # write solid set2
+        f.write("*SET_SOLID\n")
+        f.write("$#     sid    solver\n")
+        f.write("         2MECH\n")
+        f.write(
+            "$#      k1        k2        k3        k4        k5        k6        k7        k8\n"
+        )
+        e_num = 0
+        for i in range(len(part_id)):
+            if part_id[i] == 2:
+                f.write(f"{i + 1:10d}")
+                e_num = e_num + 1
+                if (e_num) % 8 == 0:
+                    f.write("\n")
+        f.write("\n")
+        f.write("*END")
 
 
 def load_mesh_file(filename):
@@ -236,7 +231,7 @@ def load_mesh_file(filename):
                         continue
                     text = line.split()
                     if first:
-                        element_base = int(text[0])
+                        int(text[0])
                         first = False
                     elements.append(
                         [
@@ -254,13 +249,6 @@ def load_mesh_file(filename):
                 break
 
     return np.array(nodes), np.array(elements)
-
-
-def load_toolpath(filename):
-    toolpath_raw = pd.read_table(
-        filename, delimiter=r"\s+", header=None, names=["time", "x", "y", "z", "state"]
-    )
-    return toolpath_raw.to_numpy()
 
 
 @jit(nopython=True)
@@ -293,8 +281,8 @@ def assign_birth_time(
             [toolpath[i - 1, 2], toolpath[i, 2]],
         )
         if mode == 0:
-            for j in range(0, num):
-                for k in range(0, ele_nodes.shape[0]):
+            for j in range(num):
+                for k in range(ele_nodes.shape[0]):
                     if element_birth[k] == -1 and ele_topz[k] <= toolpath[i, 3] + 1e-5:
                         distance = (ele_ctrl[k, 0] - X[j]) ** 2 + (
                             ele_ctrl[k, 1] - Y[j]
@@ -303,8 +291,8 @@ def assign_birth_time(
                             element_birth[k] = t[j]
         # flat head
         if mode == 1:
-            for j in range(0, num):
-                for k in range(0, ele_nodes.shape[0]):
+            for j in range(num):
+                for k in range(ele_nodes.shape[0]):
                     if element_birth[k] == -1 and ele_topz[k] <= toolpath[i, 3] + 1e-5:
                         distance = (ele_ctrl[k, 0] - X[j]) ** 2 + (
                             ele_ctrl[k, 1] - Y[j]
@@ -321,7 +309,7 @@ def assign_birth_time(
                             element_birth[k] = t[j]
         # no birth
         if mode == 2:
-            for k in range(0, ele_nodes.shape[0]):
+            for k in range(ele_nodes.shape[0]):
                 element_birth[k] = 0
 
 
@@ -334,8 +322,10 @@ def write_birth(
     gif_end=-1,
     nFrame=200,
     mode=0,
-    camera_position=[(0, -100, 180), (0, 0, 0), (0.0, 0.0, 1.0)],
+    camera_position=None,
 ):
+    if camera_position is None:
+        camera_position = [(0, -100, 180), (0, 0, 0), (0.0, 0.0, 1.0)]
     nodes, elements = load_mesh_file(output_file)
     ele_nodes = nodes[elements]
     ele_ctrl = ele_nodes.sum(axis=1) / 8
@@ -360,7 +350,7 @@ def write_birth(
     x = np.interp(time, toolpath[:, 0], toolpath[:, 1])
     y = np.interp(time, toolpath[:, 0], toolpath[:, 2])
     z = np.interp(time, toolpath[:, 0], toolpath[:, 3])
-    toolpath_interp = np.array([time, x, y, z]).transpose()
+    np.array([time, x, y, z]).transpose()
 
     # display = Display(visible=0)
     # _ = display.start()
@@ -390,27 +380,27 @@ def write_birth(
         axis=1,
     )
     element_birth = element_birth[element_birth[:, 1].argsort()]
-    f = open(output_file, "r+")
-    old = f.read()
-    f.seek(0)
-    # write node information
-    f.write("*DEFINE_CURVE\n")
-    f.write("         1                 1.0       1.0\n")
-    for e_b in element_birth:
-        if e_b[1] > 0:
-            f.write("%20.8f" % e_b[1])
-            f.write("%20.8f\n" % (e_b[0] + 1))
-        if e_b[1] < 0:
-            f.write("%20.8f" % 100000)
-            f.write("%20.8f\n" % (e_b[0] + 1))
-    f.write(old)
+    with open(output_file, "r+") as f:
+        old = f.read()
+        f.seek(0)
+        # write node information
+        f.write("*DEFINE_CURVE\n")
+        f.write("         1                 1.0       1.0\n")
+        for e_b in element_birth:
+            if e_b[1] > 0:
+                f.write(f"{e_b[1]:20.8f}")
+                f.write(f"{e_b[0] + 1:20.8f}\n")
+            if e_b[1] < 0:
+                f.write(f"{100000:20.8f}")
+                f.write(f"{e_b[0] + 1:20.8f}\n")
+        f.write(old)
 
 
 def write_parameters(output_file, base_name="toolpath.crs", end_time=1.0):
-    f = open(output_file, "r+")
-    old = f.read()
-    f.seek(0)
-    text = f"""*KEYWORD_ID
+    with open(output_file, "r+") as f:
+        old = f.read()
+        f.seek(0)
+        text = f"""*KEYWORD_ID
 DED
 *PARAMETER
 Rboltz    5.6704E-14
@@ -470,18 +460,18 @@ $HMNAME LOADCOLS       1InitialTemp_1
 $HWCOLOR LOADCOLS       1       3
          1     300.0
 """
-    f.write(text)
-    f.write(old)
+        f.write(text)
+        f.write(old)
 
 
 @jit("void(int64[:,:], float64[:],float64[:])", nopython=True)
 def asign_birth_node(elements, element_birth, node_birth):
-    for i in range(0, elements.shape[0]):
+    for i in range(elements.shape[0]):
         element = elements[i]
         birth = element_birth[i]
         if birth < 0:
             continue
-        for j in range(0, 8):
+        for j in range(8):
             node = element[j]
             if node_birth[node] > birth or node_birth[node] < 0:
                 node_birth[node] = birth
@@ -493,10 +483,10 @@ def renum_ele_node(nodes, elements, node_birth, element_birth, element_mat):
     n_id_map = np.zeros_like(n_id_sort)
     nodes = nodes[n_id_sort]
     node_birth = node_birth[n_id_sort]
-    for i in range(0, n_id_sort.shape[0]):
+    for i in range(n_id_sort.shape[0]):
         n_id_map[n_id_sort[i]] = i
-    for i in range(0, elements.shape[0]):
-        for j in range(0, 8):
+    for i in range(elements.shape[0]):
+        for j in range(8):
             elements[i, j] = n_id_map[elements[i, j]]
     e_id_sort = np.argsort(element_birth)
     elements = elements[e_id_sort]
@@ -510,16 +500,16 @@ def renum_ele_node(nodes, elements, node_birth, element_birth, element_mat):
 )
 def createElElConn(elements, connElEl, connVec, connVecIndx, conn_to_el_Vec):
     ele_num = elements.shape[0]
-    for i in range(0, ele_num):
+    for i in range(ele_num):
         element = elements[i]
-        for j in range(0, 8):
+        for j in range(8):
             node = element[j]
             lower_bound = np.searchsorted(connVec, node)
             higher_bound = np.searchsorted(connVec, node, side="right")
             for k in range(lower_bound, higher_bound):
                 nodeEleK = connVecIndx[k]
                 if i != conn_to_el_Vec[nodeEleK]:
-                    for l in range(0, 100):
+                    for l in range(100):
                         if connElEl[i, l] == conn_to_el_Vec[nodeEleK]:
                             break
                         if connElEl[i, l] == -1:
@@ -532,7 +522,7 @@ def createElElConn(elements, connElEl, connVec, connVecIndx, conn_to_el_Vec):
     nopython=True,
 )
 def createConnSurf(elements, connElEl, connect_surf):
-    for i in range(0, elements.shape[0]):
+    for i in range(elements.shape[0]):
         element = elements[i]
         for j in connElEl[i, :]:
             if j == -1:
@@ -542,8 +532,8 @@ def createConnSurf(elements, connElEl, connect_surf):
             s_element = elements[j]
             ind = np.zeros(4)
             num = 0
-            for k in range(0, 8):
-                for l in range(0, 8):
+            for k in range(8):
+                for l in range(8):
                     if element[k] == s_element[l]:
                         ind[num] = k
                         num = num + 1
@@ -563,8 +553,8 @@ def createConnSurf(elements, connElEl, connect_surf):
             s_element = elements[j]
             ind = np.zeros(4)
             num = 0
-            for k in range(0, 8):
-                for l in range(0, 8):
+            for k in range(8):
+                for l in range(8):
                     if element[k] == s_element[l]:
                         ind[num] = k
                         num = num + 1
@@ -599,10 +589,10 @@ def createSurf(
             [1, 2, 6, 5],
         ]
     )
-    for i in range(0, elements.shape[0]):
+    for i in range(elements.shape[0]):
         element = elements[i]
         birth_current = element_birth[i]
-        for j in range(0, 6):
+        for j in range(6):
             if connect_surf[i][j] == -1:
                 birth_neighbor = 1e10
             else:
@@ -628,7 +618,7 @@ def createSurf(
 
     ########################################
     height = -nodes[:, 2].min()
-    for i in range(0, surface_num):
+    for i in range(surface_num):
         if min(nodes[surfaces[i, :]][:, 2]) >= -height:
             surface_flux[i] = 1
 
@@ -650,7 +640,7 @@ def get_toolpath(toolpath_raw, dt, endtime):
 
     laser_state = np.interp(time, toolpath_raw[:, 0], toolpath_raw[:, 4])
     l = np.zeros_like(laser_state)
-    for i in range(0, laser_state.shape[0] - 1):
+    for i in range(laser_state.shape[0] - 1):
         if laser_state[i + 1] > laser_state[i] or laser_state[i] == 1:
             l[i] = 1
         else:
@@ -727,7 +717,7 @@ def derivate_shape_fnc_element(parCoord):
 
 
 def shape_fnc_surface(parCoord):
-    N = np.zeros((4))
+    N = np.zeros(4)
     chsi = parCoord[0]
     eta = parCoord[1]
     N = 0.25 * np.array(
@@ -889,11 +879,11 @@ class domain_mgr:
                 elif line.split()[0] == "*PARAMETER":
                     line = next(f)
                     if line.split()[0] == "Rboltz":
-                        boltz = float(line.split()[1])
+                        float(line.split()[1])
                     if line.split()[0] == "Rambient":
                         self.ambient = float(line.split()[1])
                     if line.split()[0] == "Rabszero":
-                        abszero = float(line.split()[1])
+                        float(line.split()[1])
                     line = next(f)
 
                 elif line.split()[0] == "*GAUSS_LASER":
@@ -915,7 +905,7 @@ class domain_mgr:
                 elif line.split()[0] == "*DATABASE_NODOUT":
                     line = next(f)
                     line = next(f)
-                    output_step = float(line.split()[0])
+                    float(line.split()[0])
 
                 elif line.split()[0] == "*LOAD_NODE_SET":
                     while True:
@@ -1009,10 +999,10 @@ class domain_mgr:
             n_id_map = np.zeros_like(n_id_sort)
             nodes = nodes[n_id_sort]
             node_birth = node_birth[n_id_sort]
-            for i in range(0, n_id_sort.shape[0]):
+            for i in range(n_id_sort.shape[0]):
                 n_id_map[n_id_sort[i]] = i
-            for i in range(0, elements.shape[0]):
-                for j in range(0, 8):
+            for i in range(elements.shape[0]):
+                for j in range(8):
                     elements[i, j] = n_id_map[elements[i, j]]
             e_id_sort = np.argsort(element_birth)
             elements = elements[e_id_sort]
@@ -1026,7 +1016,7 @@ class domain_mgr:
         self.nE = self.elements.shape[0]
         self.element_birth = element_birth
         ind = (nodes[elements, 2]).argsort()
-        elements_order = [elements[i, ind[i]] for i in range(0, ind.shape[0])]
+        elements_order = [elements[i, ind[i]] for i in range(ind.shape[0])]
         self.elements_order = cp.array(elements_order)
         self.element_mat = element_mat
 
@@ -1038,32 +1028,32 @@ class domain_mgr:
         start = time.time()
         self.load_file()
         end = time.time()
-        print("Time of reading input files: {}".format(end - start))
+        print(f"Time of reading input files: {end - start}")
 
         # calculating critical timestep
         self.defaultFac = 0.8
         start = time.time()
         self.get_timestep()
         end = time.time()
-        print("Time of calculating critical timestep: {}".format(end - start))
+        print(f"Time of calculating critical timestep: {end - start}")
 
         # reading and interpolating toolpath
         start = time.time()
         toolpath_raw = load_toolpath(filename=self.toolpath_file)
         toolpath = get_toolpath(toolpath_raw, self.dt, self.end_time)
         end = time.time()
-        print("Time of reading and interpolating toolpath: {}".format(end - start))
+        print(f"Time of reading and interpolating toolpath: {end - start}")
         self.toolpath = cp.asarray(toolpath)
 
-        print("Number of nodes: {}".format(len(self.nodes)))
-        print("Number of elements: {}".format(len(self.elements)))
-        print("Number of time-steps: {}".format(len(self.toolpath)))
+        print(f"Number of nodes: {len(self.nodes)}")
+        print(f"Number of elements: {len(self.elements)}")
+        print(f"Number of time-steps: {len(self.toolpath)}")
 
         # generating surface
         start = time.time()
         self.generate_surf()
         end = time.time()
-        print("Time of generating surface: {}".format(end - start))
+        print(f"Time of generating surface: {end - start}")
 
     def generate_surf(self):
         elements = self.elements
@@ -1170,7 +1160,7 @@ class domain_mgr:
                 [1, 2, 6, 5],
             ],
         ]
-        surf_ip_pos = self.Nip_sur @ self.nodes[element_surface]
+        self.Nip_sur @ self.nodes[element_surface]
         nodes_pos = self.nodes[element_surface]
         mapped_surf_nodes_pos = cp.zeros([nodes_pos.shape[0], 6, 4, 2])
         u = nodes_pos[:, :, 1, :] - nodes_pos[:, :, 0, :]
@@ -1256,7 +1246,7 @@ class heat_solve_mgr:
         self.Cond_Ip *= 0
 
         ##### temp-dependent, modification needed, from files
-        for i in range(0, len(domain.mat_thermal)):
+        for i in range(len(domain.mat_thermal)):
             matID = domain.mat_thermal[i][0]
             mat = domain.element_mat == matID
             thetaIp = temperature_ip[domain.active_elements * mat]
@@ -1290,9 +1280,7 @@ class heat_solve_mgr:
                 self.Cond_Ip[domain.active_elements * mat] += domain.mat_thermal[i][6]
 
     def update_mvec_stifness(self):
-        nodes = self.domain.nodes
         elements = self.domain.elements[self.domain.active_elements]
-        Bip_ele = self.domain.Bip_ele
         Nip_ele = self.domain.Nip_ele
         temperature_nodes = self.temperature[elements]
 
@@ -1324,9 +1312,7 @@ class heat_solve_mgr:
 
     def update_fluxes(self):
         surface = self.domain.surface[self.domain.active_surface]
-        nodes = self.domain.nodes
         Nip_sur = self.domain.Nip_sur
-        Bip_sur = self.domain.Bip_sur
         surface_xy = self.domain.surface_xy[self.domain.active_surface]
         surface_flux = self.domain.surface_flux[self.domain.active_surface]
 
@@ -1392,7 +1378,7 @@ class heat_solve_mgr:
         elements = domain.elements_order[domain.active_elements]
         temperature_ele_nodes = self.temperature[elements]
 
-        temperature_ele_max = temperature_ele_nodes.max(axis=1)
+        temperature_ele_nodes.max(axis=1)
         elements = elements[temperature_ele_nodes[:, 4:8].max(axis=1) >= solidus]
         temperature_ele_nodes = self.temperature[elements]
         if elements.shape[0] > 0:

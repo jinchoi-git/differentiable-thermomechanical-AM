@@ -1,7 +1,8 @@
+from pathlib import Path
+
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-import jax.numpy as jnp
-from pathlib import Path
 
 '''
 Load mesh information from .k file in LS-DYNA input format
@@ -123,8 +124,7 @@ def load_inputfile(filename='data/0.k'):
             for s_surf in element_surface[s_ind]:
                 if set(surf) == set(s_surf):
                     return surf_ind
-        else:
-            return -1
+        return -1
 
     element_surface_neighbor = np.ones((len(elements), 6), dtype=np.int32) * -1
     for ind, element in enumerate(elements):
@@ -201,7 +201,7 @@ def derivate_shape_fnc_element(parCoord):
     return B
 
 def shape_fnc_surface(parCoord):
-    N = jnp.zeros((4))
+    N = jnp.zeros(4)
     chsi = parCoord[0]
     eta  = parCoord[1]
     N = 0.25 * jnp.array([(1-chsi)*(1-eta), (1+chsi)*(1-eta), (1+chsi)*(1+eta), (1-chsi)*(1+eta)])
@@ -276,9 +276,9 @@ def load_data(data_dir=None, toolpath_name=None, dt=0.01):
     Bip_sur = jnp.stack([derivate_shape_fnc_surface(pc) for pc in parCoords_surface], axis=0)
     surf_detJacs = surface_jacobian(nodes, surfaces, Bip_sur)
 
-    print("Number of nodes: {}".format(len(nodes)))
-    print("Number of elements: {}".format(len(elements)))
-    print("Number of surfaces: {}".format(len(surfaces)))
-    print("Number of time-steps: {}".format(len(toolpath)))
+    print(f"Number of nodes: {len(nodes)}")
+    print(f"Number of elements: {len(elements)}")
+    print(f"Number of surfaces: {len(surfaces)}")
+    print(f"Number of time-steps: {len(toolpath)}")
 
     return elements, nodes, surfaces, node_birth, element_birth, surface_birth, surface_xy, surface_flux, toolpath, state, endTime, Nip_ele, Bip_ele, Nip_sur, Bip_sur, surf_detJacs

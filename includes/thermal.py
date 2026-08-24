@@ -1,7 +1,7 @@
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
-import numpy as np
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -233,8 +233,6 @@ def simulate_temperature(control, tctx):
 
     # ---- pull from context (no behavior change) ----
     n_n = tctx.n_n
-    n_e = tctx.n_e
-    n_q = tctx.n_q
     elements = tctx.elements
     nodes = tctx.nodes
     Nip_ele = tctx.Nip_ele
@@ -249,12 +247,10 @@ def simulate_temperature(control, tctx):
     ambient = tctx.ambient
     density = tctx.density
     cp_val = tctx.cp_val
-    cond_val = tctx.cond_val
     conds = tctx.conds  # preferred if you assemble per-element/IP k
 
     h_conv = tctx.h_conv
     emissivity = tctx.emissivity
-    sigma = tctx.stefan_boltz
 
     solidus = tctx.solidus
     liquidus = tctx.liquidus
@@ -330,7 +326,7 @@ def simulate_temperature(control, tctx):
     t_seq = jnp.arange(0, steps)
     control_seq = control
     carry = (jnp.full((n_n,), ambient), jnp.full((steps, n_n), ambient))
-    (temperature_final, temperatures), _ = jax.lax.scan(
+    (_temperature_final, temperatures), _ = jax.lax.scan(
         thermal_step, carry, (t_seq, control_seq)
     )
     return temperatures
