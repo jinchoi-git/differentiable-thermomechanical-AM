@@ -1,0 +1,33 @@
+# Primary environment: Linux + NVIDIA GPU (CUDA 12.x driver required).
+# Covers the full pipeline, including the GPU-only preprocessing step
+# (experimental/preprocess.py, includes/preprocessor.py: cupy + numba).
+#
+# Create:   conda env create -f environment.yml
+# Update:   conda env update -f environment.yml --prune
+#
+# NOTE: this file has NOT been dependency-solved or run on real hardware
+# in this refresh (authored on a Mac with no NVIDIA GPU). Validate on a
+# Linux + CUDA 12 machine before relying on it, and re-pin exact versions
+# with `conda env export --from-history` / `pip freeze` once confirmed
+# working, so the run is reproducible going forward.
+name: diffmech-am
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cuda-version=12
+  - numpy>=1.26
+  - scipy>=1.11
+  - pandas>=2.1
+  - matplotlib>=3.8
+  - pyvista>=0.44
+  - vtk>=9.3
+  - imageio>=2.34
+  - imageio-ffmpeg>=0.5
+  - pillow>=10.4
+  - numba>=0.60
+  - cupy>=13.0
+  - pip
+  - pip:
+      - "jax[cuda12]==0.11.1"
+      - "optax==0.2.8"
