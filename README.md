@@ -1,6 +1,6 @@
 # Differentiable Thermomechanical AM
 
-JAX-based, end-to-end differentiable thermomechanical simulation of laser powder directed energy deposition (DED), used to inversely optimize a time-series laser power schedule that minimizes post-build residual stress while maintaining adequate melting. Companion code for the accompanying thesis chapter ("Differentiable Thermomechanical Simulation for Automatic Minimization of Post-build Residual Stress in Directed Energy Deposition").
+JAX-based, end-to-end differentiable thermomechanical simulation of laser powder directed energy deposition (DED), used to inversely optimize a time-series laser power schedule that minimizes post-build residual stress while maintaining adequate melting. 
 
 The pipeline chains a moving-laser-source thermal FEA solver to an elastoplastic mechanical FEA solver, both written in JAX, and optimizes the laser power schedule (Adam or L-BFGS-B) against a two-component stress + melt objective via automatic differentiation (custom adjoint through the implicit mechanics Newton solve).
 
@@ -16,7 +16,7 @@ The pipeline chains a moving-laser-source thermal FEA solver to an elastoplastic
 
 Two conda environments are provided:
 
-- **`environment.yml`** — Linux + NVIDIA GPU (CUDA 12.x driver). Covers the full pipeline, including the GPU-only preprocessing step (`cupy`, `numba`). This is what you need to reproduce the thesis's timing numbers or to regenerate datasets from raw mesh/toolpath files.
+- **`environment.yml`** — Linux + NVIDIA GPU (CUDA 12.x driver). Covers the full pipeline, including the GPU-only preprocessing step (`cupy`, `numba`).
 - **`environment-cpu.yml`** — CPU-only. Enough to run `Optimizer_main.py` against the four datasets already checked into `preprocessed/*_preprocessed/` (slower, but no GPU required). Cannot run the preprocessing step.
 
 ```bash
@@ -36,7 +36,7 @@ Python 3.12 is a hard requirement (not just a recommendation) — `includes/util
    ```
    Modes: `adam`, `bfgs`, `gradcheck`, `forward`, `baseline`, `baseline_avg`.
    Flags: `--iters` (optimizer iterations, default 10), `--n-blocks` (number of piecewise-linear power control knots, default 10), `--gpu` (CUDA device id), `--tag` (optional run-folder label), `--ts` (add a timestamp subfolder).
-3) To reproduce the thesis's three case studies:
+3) To reproduce the case studies:
 
    | Case | `base_name` | `--n-blocks` | `--iters` |
    |---|---|---|---|
@@ -56,7 +56,7 @@ Python 3.12 is a hard requirement (not just a recommendation) — `includes/util
 
 ## Known limitations
 - The mechanics solve is downsampled to every 10th thermal step (`stride=10` in `includes/mech.py`), and `includes/utils.py:save_vtk` independently hardcodes a matching `dt=0.1`/`×10` step-index calculation for VTK export timing. These are currently self-consistent (thermal `dt=0.01` × stride 10 = 0.1) but not derived from each other — changing one without the other will silently desync VTK export timestamps from the real elapsed time.
-- Memory grows as `O(N_timesteps × N_mesh)` since the differentiable simulation unrolls gradients through time without checkpointing — this bounds how large a case can be optimized on a single GPU (see thesis §4.4, "Conclusion," for discussion of checkpointing/multi-GPU as future work).
+- Memory grows as `O(N_timesteps × N_mesh)` since the differentiable simulation unrolls gradients through time without checkpointing — this bounds how large a case can be optimized on a single GPU
 - `includes/preprocessor.py`'s `write_parameters` embeds a legacy IN718 material template (`*MAT_THERMAL_ISOTROPIC_TD`, `*GAUSS_LASER 400 1.12 0.4`) left over from an earlier case study; the JAX pipeline reads Ti-6Al-4V properties directly from `materials/TI64_*_Debroy.txt` and ignores this template, but it's a placeholder to update if the `.k`-file material block is ever wired back in.
 
 ## Housekeeping
