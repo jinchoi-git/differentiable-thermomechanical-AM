@@ -162,6 +162,13 @@ cg_tol = 1e-4
 Maxit = 8
 # params = jnp.ones((power_on_steps,))
 N_BLOCKS = args.n_blocks
+if power_on_steps % N_BLOCKS != 0:
+    valid = [d for d in range(1, power_on_steps + 1) if power_on_steps % d == 0]
+    raise SystemExit(
+        f"--n-blocks={N_BLOCKS} must evenly divide this dataset's power-on window "
+        f"({power_on_steps} steps at dt={dt}) — expand_blocks_to_controls' knot "
+        f"spacing assumes an exact divisor. Valid values: {valid}"
+    )
 params = jnp.ones((N_BLOCKS,))  # start at nominal power 1.0
 
 tctx = ThermContext(
@@ -675,7 +682,7 @@ if __name__ == "__main__":
     if mode == "gradcheck":
         print("Running gradient check...")
         init_params = np.array(params)
-        grad_check(init_params, eps=1e-3, n_checks=10)
+        grad_check(init_params, eps=1e-3, n_checks=min(10, len(init_params)))
     elif mode == "adam":
         print("Running optimization (Adam)...")
         trained_params, loss_history, control_history = optimize_adam(
