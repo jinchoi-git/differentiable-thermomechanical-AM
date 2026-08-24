@@ -1,0 +1,26 @@
+# CPU-only environment: for editing, testing, and running Optimizer_main.py
+# against the already-preprocessed datasets in preprocessed/*_preprocessed/.
+# Does NOT include cupy/numba, so it cannot run the GPU-only preprocessing
+# step (experimental/preprocess.py) that regenerates those datasets from raw
+# mesh/toolpath files — use environment.yml on a CUDA machine for that.
+#
+# Create:   conda env create -f environment-cpu.yml
+# Update:   conda env update -f environment-cpu.yml --prune
+name: diffmech-am-cpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=1.26
+  - scipy>=1.11
+  - pandas>=2.1
+  - matplotlib>=3.8
+  - pyvista>=0.44
+  - vtk>=9.3
+  - imageio>=2.34
+  - imageio-ffmpeg>=0.5
+  - pillow>=10.4
+  - pip
+  - pip:
+      - "jax==0.11.1"
+      - "optax==0.2.8"
