@@ -1,4 +1,6 @@
 # --- Visualization & Animation helpers ---------------------------------------
+from __future__ import annotations
+
 import datetime
 import glob
 import os

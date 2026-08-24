@@ -20,6 +20,12 @@ parser.add_argument(
 parser.add_argument(
     "--ts", action="store_true", help="Add a timestamp subfolder (disabled by default)"
 )
+parser.add_argument(
+    "--n-blocks",
+    type=int,
+    default=10,
+    help="Number of piecewise-linear power control knots (Adam/BFGS)",
+)
 args = parser.parse_args()
 
 # GPU must be set before importing jax
@@ -61,7 +67,7 @@ base_name = "1_stsl"
 # base_name = '3_mtsl'
 # base_name = '4_mtml'
 learning_rate = 1e-2
-work_dir = RESULTS_ROOT / f"{base_name}_bfgsbound_10params_gradcheck"
+work_dir = RESULTS_ROOT / f"{base_name}_bfgsbound_{args.n_blocks}params_gradcheck"
 run_dir = make_run_dir(str(work_dir), args.mode, tag=args.tag, timestamp=args.ts)
 print(f"[io] run_dir = {run_dir}")
 os.makedirs(run_dir, exist_ok=True)
@@ -118,7 +124,6 @@ solidus = 1878
 liquidus = 1928
 latent = 286 / (liquidus - solidus)
 conds = jnp.ones((n_e, 8)) * cond_val
-stefan_boltz = 5.670374419e-8  # W*m^-2*K^-4 (Stefan-Boltzmann)
 
 # Dirichlet boundary
 BOT_NODES = nodes[:, 2] < BOT_HEIGHT
@@ -156,7 +161,7 @@ tol = 1e-4
 cg_tol = 1e-4
 Maxit = 8
 # params = jnp.ones((power_on_steps,))
-N_BLOCKS = 10
+N_BLOCKS = args.n_blocks
 params = jnp.ones((N_BLOCKS,))  # start at nominal power 1.0
 
 tctx = ThermContext(
@@ -182,7 +187,6 @@ tctx = ThermContext(
     conds=conds,
     h_conv=float(h_conv),
     emissivity=float(emissivity),
-    stefan_boltz=float(stefan_boltz),
     solidus=float(solidus),
     liquidus=float(liquidus),
     latent=float(latent),

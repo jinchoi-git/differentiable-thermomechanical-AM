@@ -31,7 +31,6 @@ class ThermContext:
 
     h_conv: float  # 0.00005
     emissivity: float  # 0.2
-    stefan_boltz: float  # 5.670374419e-8 (if you use radiation anywhere)
 
     # --- phase window (if used in your model) ---
     solidus: float  # 1878
