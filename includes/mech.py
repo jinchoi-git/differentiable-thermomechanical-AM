@@ -339,7 +339,6 @@ def mech(
 ):
     
     # --- pull from context (no behavior change) --- #
-    n_n = mctx.n_n
     n_e = mctx.n_e
     n_q = mctx.n_q
     elements = mctx.elements
@@ -361,7 +360,6 @@ def mech(
     # Masks
     mask_e = active_element_inds                # (n_e,)
     mask_n = active_node_inds                   # (n_n,)
-    n_n * 3
 
     # # Interpolate temperature at integration points
     temperature_ip = (

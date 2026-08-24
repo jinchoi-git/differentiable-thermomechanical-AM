@@ -231,7 +231,6 @@ def load_mesh_file(filename):
                         continue
                     text = line.split()
                     if first:
-                        int(text[0])
                         first = False
                     elements.append(
                         [
@@ -343,15 +342,6 @@ def write_birth(
         path_resolution,
         mode,
     )
-    # save gif
-    if gif_end == -1:
-        gif_end = toolpath[-1, 0]
-    time = np.linspace(gif_start, gif_end, nFrame)
-    x = np.interp(time, toolpath[:, 0], toolpath[:, 1])
-    y = np.interp(time, toolpath[:, 0], toolpath[:, 2])
-    z = np.interp(time, toolpath[:, 0], toolpath[:, 3])
-    np.array([time, x, y, z]).transpose()
-
     # display = Display(visible=0)
     # _ = display.start()
     # p = pv.Plotter(window_size=(1000,800))
@@ -878,12 +868,8 @@ class domain_mgr:
 
                 elif line.split()[0] == "*PARAMETER":
                     line = next(f)
-                    if line.split()[0] == "Rboltz":
-                        float(line.split()[1])
                     if line.split()[0] == "Rambient":
                         self.ambient = float(line.split()[1])
-                    if line.split()[0] == "Rabszero":
-                        float(line.split()[1])
                     line = next(f)
 
                 elif line.split()[0] == "*GAUSS_LASER":
@@ -905,7 +891,6 @@ class domain_mgr:
                 elif line.split()[0] == "*DATABASE_NODOUT":
                     line = next(f)
                     line = next(f)
-                    float(line.split()[0])
 
                 elif line.split()[0] == "*LOAD_NODE_SET":
                     while True:
@@ -1160,7 +1145,6 @@ class domain_mgr:
                 [1, 2, 6, 5],
             ],
         ]
-        self.Nip_sur @ self.nodes[element_surface]
         nodes_pos = self.nodes[element_surface]
         mapped_surf_nodes_pos = cp.zeros([nodes_pos.shape[0], 6, 4, 2])
         u = nodes_pos[:, :, 1, :] - nodes_pos[:, :, 0, :]
@@ -1378,7 +1362,6 @@ class heat_solve_mgr:
         elements = domain.elements_order[domain.active_elements]
         temperature_ele_nodes = self.temperature[elements]
 
-        temperature_ele_nodes.max(axis=1)
         elements = elements[temperature_ele_nodes[:, 4:8].max(axis=1) >= solidus]
         temperature_ele_nodes = self.temperature[elements]
         if elements.shape[0] > 0:

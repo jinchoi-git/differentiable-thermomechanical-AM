@@ -172,20 +172,6 @@ def save_vtk(
         active_grid.save(filename)
 
 
-def find_latest(prefix, run_dir):
-    files = [
-        f for f in os.listdir(run_dir) if f.startswith(prefix) and f.endswith(".npy")
-    ]
-    print(f"Found {len(files)} '{prefix}_*.npy' files")
-    if not files:
-        raise FileNotFoundError(f"No files with prefix '{prefix}' in {run_dir}")
-    iters = [int(f.split("_")[1].split(".")[0]) for f in files]
-    latest_iter = max(iters)
-    latest_file = f"{prefix}_{latest_iter:04d}.npy"
-    print(f"[io] Latest {prefix} file: {latest_file} (iter {latest_iter})")
-    return os.path.join(run_dir, latest_file), latest_iter
-
-
 def _numeric_key(path: str):
     """Sorts ..._0000.png, ..._0001.png, ..._0010.png in numeric order."""
     m = list(_num_re.finditer(os.path.basename(path)))
